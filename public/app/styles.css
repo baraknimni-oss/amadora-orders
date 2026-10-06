@@ -455,3 +455,29 @@ table.t { width: 100%; border-collapse: collapse; font-size: 13px; }
   .kpi .v { font-size: 21px; }
   .hide-sm { display: none !important; }
 }
+
+/* ---------- Bulk selection (כל ההזמנות) ---------- */
+.t th.chk, .t td.chk { width: 34px; padding-inline: 10px 4px; cursor: default; }
+.t .chk input { width: 17px; height: 17px; accent-color: var(--gold); cursor: pointer; vertical-align: middle; }
+.t tbody tr.sel td { background: var(--gold-soft); }
+.bulk-bar {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 10px; padding: 10px 14px; margin-bottom: 12px;
+  background: var(--gold-soft); border: 1px solid var(--gold); border-radius: var(--radius); position: sticky; top: 8px; z-index: 5;
+}
+.bulk-bar .input { padding-block: 5px; }
+
+/* ---------- Stats period picker & report ---------- */
+.period-pick { display: inline-flex; align-items: center; gap: 6px; }
+.period-pick .input { width: auto; min-width: 170px; }
+.chart .bcol.on i { background: var(--gold-strong); box-shadow: 0 0 0 2px var(--gold-soft), 0 0 0 3px var(--gold); }
+.report-preview:empty { display: none; }
+
+/* ---------- Optional cost fields inside a card ("דורש טיפול") ---------- */
+.oc-cost { background: var(--surface-2); border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; gap: 6px; }
+.oc-cost .oc-cost-l { font-size: 12.5px; font-weight: 600; color: var(--ink-2); }
+.oc-cost-row { display: flex; gap: 6px; align-items: center; }
+.oc-cost-row .money-in { flex: 1; min-width: 0; }
+.oc-cost-row .money-in input { padding-block: 6px; }
+.oc-cost-row .btn { margin-top: 0; }
+.oc-cost-s { font-size: 11.5px; color: var(--muted); }
+.oc-cost-err { font-size: 12px; color: var(--crit); }
