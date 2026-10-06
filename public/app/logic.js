@@ -1,30 +1,36 @@
 // Business rules shared by every screen. Pure functions only (no DOM, no network).
 
+// A new order opens directly in "to_factory" (the old "הזמנה נכנסה" stage was removed).
 export const STATUSES = [
-  { key: 'new',           step: 1, group: 'משרד',  name: 'הזמנה נכנסה' },
-  { key: 'to_factory',    step: 2, group: 'משרד',  name: 'לצורך משלוח למפעל או הכנסת יהלומים' },
-  { key: 'factory',       step: 3, group: 'ייצור', name: 'מפעל' },
-  { key: 'returned',      step: 4, group: 'משרד',  name: 'חזר ממפעל' },
-  { key: 'ready',         step: 5, group: 'מסירה', name: 'מוכן למסירה' },
-  { key: 'with_customer', step: 6, group: 'לקוח',  name: 'אצל הלקוח' },
+  { key: 'to_factory',    step: 1, group: 'משרד',  name: 'לצורך משלוח למפעל או הכנסת יהלומים' },
+  { key: 'factory',       step: 2, group: 'ייצור', name: 'מפעל' },
+  { key: 'returned',      step: 3, group: 'משרד',  name: 'חזר ממפעל' },
+  { key: 'ready',         step: 4, group: 'מסירה', name: 'מוכן למסירה' },
+  { key: 'with_customer', step: 5, group: 'לקוח',  name: 'אצל הלקוח' },
 ];
+export const FIRST_STATUS = 'to_factory';
 export const UNASSIGNED = { key: 'unassigned', step: 0, group: '', name: 'ממתין לשיוך סטטוס' };
-export const STATUS_BY_KEY = Object.fromEntries([...STATUSES, UNASSIGNED].map(s => [s.key, s]));
+// Removed stage, kept only so older history entries still read correctly.
+const LEGACY_NEW = { key: 'new', step: 0, group: 'משרד', name: 'הזמנה נכנסה' };
+export const STATUS_BY_KEY = Object.fromEntries([...STATUSES, UNASSIGNED, LEGACY_NEW].map(s => [s.key, s]));
 export const statusKey = o => o.status || 'unassigned';
 export const statusInfo = keyOrOrder => STATUS_BY_KEY[typeof keyOrOrder === 'string' ? keyOrOrder : statusKey(keyOrOrder)];
 export const statusLabel = k => { const s = statusInfo(k); return s.group && s.key !== 'ready' && s.key !== 'with_customer' ? `${s.group} – ${s.name}` : s.name; };
-export const nextStatus = o => { const i = STATUSES.findIndex(s => s.key === o.status); return i >= 0 && i < STATUSES.length - 1 ? STATUSES[i + 1] : (o.status ? null : STATUSES[0]); };
+export const nextStatus = o => { const i = STATUSES.findIndex(s => s.key === o.status); return i < 0 ? STATUSES[0] : i < STATUSES.length - 1 ? STATUSES[i + 1] : null; };
 export const NEEDS_PAYMENT2 = new Set(['ready', 'with_customer']);
 export const stepOf = k => STATUS_BY_KEY[k || 'unassigned']?.step ?? 0;
+const READY_STEP = stepOf('ready');
+/** Moving forward across "מוכן למסירה" (payment completion + invoice required). */
+export const crossesReady = (from, to) => !!from && stepOf(from) < READY_STEP && stepOf(to) >= READY_STEP;
 
 // ---------- Stage checklists (מסך "דורש טיפול") ----------
 // mode 'any': at least one item; 'all': every item. exclusive: ticking one clears the others.
 export const CHECKLISTS = {
-  to_factory: { mode: 'any', exclusive: true, gateStep: 3, items: [
+  to_factory: { mode: 'any', exclusive: true, gateStep: stepOf('factory'), items: [
     { key: 'stones_inserted', label: 'הכנסת אבנים' }, { key: 'stones_not_needed', label: 'אין צורך בהכנסת אבנים' }] },
-  returned: { mode: 'all', gateStep: 5, items: [
+  returned: { mode: 'all', gateStep: READY_STEP, items: [
     { key: 'check_jewelry', label: 'בדיקת התכשיט' }, { key: 'check_sizes', label: 'מידות' }, { key: 'check_gold_color', label: 'צבע זהב' }] },
-  ready: { mode: 'all', gateStep: 6, items: [{ key: 'pickup_coordinated', label: 'תיאום איסוף/משלוח' }] },
+  ready: { mode: 'all', gateStep: stepOf('with_customer'), items: [{ key: 'pickup_coordinated', label: 'תיאום איסוף/משלוח' }] },
 };
 export const CHECK_LABELS = Object.fromEntries(Object.values(CHECKLISTS).flatMap(c => c.items.map(i => [i.key, i.label])));
 export function checklistDone(o, key) {
@@ -48,7 +54,7 @@ export function transitionBlock(o, to) {
 /** Moving to this status requires the payment form first (completion missing, or no invoice yet). */
 export function needsPaymentForm(o, to) {
   if (NEEDS_PAYMENT2.has(to) && num(o.payment2_amount) == null) return true;
-  return !!o.status && stepOf(o.status) < 5 && stepOf(to) >= 5 && !o.payment2_invoice;
+  return crossesReady(o.status, to) && !o.payment2_invoice;
 }
 
 // ---------- Time at the factory ----------
@@ -197,7 +203,7 @@ export function guardRow(row, prev) {
   if (prev && row.status !== prev.status) {
     const block = transitionBlock({ ...row, status: prev.status }, row.status);
     if (block) return block;
-    if (prev.status && stepOf(prev.status) < 5 && stepOf(row.status) >= 5 && num(row.payment2_amount) != null && !row.payment2_invoice)
+    if (crossesReady(prev.status, row.status) && num(row.payment2_amount) != null && !row.payment2_invoice)
       return 'לפני מעבר ל"מוכן למסירה" יש לסמן שיצאה חשבונית על השלמת התשלום.';
   }
   if (prev && !row.is_import && num(row.payment1_amount) == null) return 'לא ניתן למחוק את סכום המקדמה (אפשר להזין 0).';
