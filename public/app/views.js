@@ -1,10 +1,10 @@
 // All screens. Each view receives the shared ctx and returns a DOM node.
-import { h, icon, statusPill, collectionPill, slaPill, orderCard, statusColor, modal, field, moneyInput, methodChips, readRadio, kv, toast, confirmBox } from './ui.js';
+import { h, icon, statusPill, collectionPill, slaPill, factoryPill, orderCard, statusColor, modal, field, moneyInput, methodChips, readRadio, kv, toast, confirmBox } from './ui.js';
 import {
   STATUSES, UNASSIGNED, STATUS_BY_KEY, statusKey, statusInfo, statusLabel, nextStatus, NEEDS_PAYMENT2, FIRST_ORDER_NUMBER,
   financials, collection, suggestedRemainder, money, money0, pct, num, sla, slaShort, SLA_TONE, urgency,
   fmtDate, fmtDateLong, fmtDateTime, todayISO, israelDate, businessDaysBetween, weekday, validateNewOrder, validatePayment2,
-  FIELD_LABELS, matchesQuery,
+  FIELD_LABELS, matchesQuery, CHECKLISTS, CHECK_LABELS, checklistDone,
 } from './logic.js';
 import { buildXlsx, download } from './xlsx.js';
 
@@ -46,12 +46,12 @@ export function dashboard(ctx) {
           value ? h('span', { class: 'tile-sum' }, money0(value)) : null)));
   });
 
-  const attPanel = card('דורש טיפול', att.length
+  const attPanel = card('קרובות למועד האספקה', att.length
     ? h('div', { class: 'rowlist' }, att.slice(0, 6).map(({ o, s }) => h('a', { href: `#/order/${o.order_number}` },
       h('div', { class: 'r-main' }, h('div', { class: 'r-title' }, `#${o.order_number} · ${o.customer_name}`), h('div', { class: 'r-sub' }, statusLabel(statusKey(o)))),
       slaPill(s))))
     : h('div', { class: 'empty' }, 'אין הזמנות קרובות למועד האספקה.'),
-  { aside: att.length ? plural(att.length, 'הזמנה', 'הזמנות') : null, foot: att.length > 6 ? h('a', { class: 'btn-link', href: '#/attention' }, 'לכל ההזמנות שדורשות טיפול') : null });
+  { aside: att.length ? plural(att.length, 'הזמנה', 'הזמנות') : null, foot: att.length > 6 ? h('a', { class: 'btn-link', href: '#/board' }, 'ללוח העבודה') : null });
 
   const toCollect = act.filter(o => ['returned', 'ready', 'with_customer'].includes(o.status) && collection(o).balance > 0.5)
     .sort((a, b) => collection(b).balance - collection(a).balance);
@@ -73,7 +73,7 @@ export function dashboard(ctx) {
   const lateCount = att.filter(x => x.s.level === 'late').length;
   return h('div', null,
     pageHead('לוח בקרה',
-      `${plural(act.length, 'הזמנה פעילה', 'הזמנות פעילות')} · ${att.length ? plural(att.length, 'דורשת טיפול', 'דורשות טיפול') : 'אין הזמנות דחופות'}${lateCount ? ` · ${lateCount} באיחור` : ''}`,
+      `${plural(act.length, 'הזמנה פעילה', 'הזמנות פעילות')} · ${att.length ? `${att.length} קרובות למועד האספקה` : 'אין הזמנות דחופות'}${lateCount ? ` · ${lateCount} באיחור` : ''}`,
       [h('a', { class: 'btn btn-ghost', href: '#/board' }, icon('board', 16), 'לוח עבודה'), h('a', { class: 'btn btn-primary', href: '#/orders/new' }, icon('plus', 16), 'הזמנה חדשה')]),
     unassigned.length ? h('div', { class: 'notice' }, icon('alert', 18),
       h('div', null, h('b', null, plural(unassigned.length, 'הזמנה ממתינה', 'הזמנות ממתינות')), ' לשיוך סטטוס (יובאו מהאקסל).'),
@@ -102,30 +102,59 @@ export function statusList(ctx, key) {
       [h('a', { class: 'btn btn-ghost', href: '#/board' }, icon('board', 16), 'תצוגת לוח')], crumbTo('#/', 'לוח בקרה')),
     statusTabs(ctx, key),
     key === 'unassigned' ? h('div', { class: 'notice' }, icon('alert', 18), 'הזמנות שיובאו מהאקסל. פתחו כל הזמנה וקבעו לה סטטוס מתוך "שינוי סטטוס".') : null,
-    key === 'returned' ? h('div', { class: 'notice' }, icon('alert', 18), `לפני מעבר ל"${next.name}" המערכת תבקש את פרטי השלמת התשלום.`) : null,
+    key === 'returned' ? h('div', { class: 'notice' }, icon('alert', 18), `לפני מעבר ל"${next.name}" יש לסמן את בדיקות השלב (במסך "דורש טיפול" או בדף ההזמנה), להזין את השלמת התשלום ולסמן שיצאה חשבונית.`) : null,
+    key === 'to_factory' || key === 'ready' ? h('div', { class: 'notice' }, icon('alert', 18), `לפני מעבר ל"${next.name}" יש לסמן את בדיקות השלב במסך "דורש טיפול" או בדף ההזמנה.`) : null,
     list.length ? h('div', { class: 'cards' }, list.map(o => orderCard(o, ctx)))
       : h('div', { class: 'card empty' }, 'אין הזמנות בשלב הזה.', key === 'new' ? h('div', { style: { 'margin-top': '10px' } }, h('a', { class: 'btn btn-primary btn-sm', href: '#/orders/new' }, 'פתיחת הזמנה חדשה')) : null));
 }
 
-// ===================================================================== ATTENTION
+// ===================================================================== ATTENTION (work board with stage checklists)
+/** The checklist block shown inside a card. Clicks here must not open the order page. */
+function checklistBox(ctx, o, key) {
+  const c = CHECKLISTS[key]; if (!c) return null;
+  const done = checklistDone(o, key);
+  const next = STATUSES.find(x => x.step === statusInfo(key).step + 1);
+  const stop = e => e.stopPropagation();
+  return h('div', { class: 'oc-check', onclick: stop, onkeydown: stop },
+  c.items.map(i => h('label', { class: 'check' },
+    h('input', { type: 'checkbox', checked: !!o[i.key], onchange: e => ctx.toggleCheck(o, i.key, e.target.checked) }), i.label)),
+  next ? h('button', { class: `btn btn-sm ${done ? 'btn-primary' : 'btn-ghost'}`, type: 'button', disabled: done ? null : true,
+    onclick: e => { e.stopPropagation(); ctx.changeStatus(o, next.key); } }, `העבר ל"${next.name}"`, icon('arrowL', 14)) : null,
+  !done ? h('div', { class: 'hint-locked' }, c.mode === 'any' ? 'יש לסמן אחת מהאפשרויות כדי להתקדם' : 'יש לסמן את כל הבדיקות כדי להתקדם') : null);
+}
+
 export function attention(ctx) {
-  const att = ctx.attention();
-  const groups = [
-    ['late', 'באיחור', 'עברו את 14 ימי העסקים'],
-    ['critical', `נותרו ${ctx.settings.warn_days_2} ימים או פחות`, null],
-    ['warn', `נותרו ${ctx.settings.warn_days_1} ימים או פחות`, null],
-  ];
-  const diffs = ctx.active().filter(o => collection(o).key === 'diff');
-  const unassigned = ctx.active().filter(o => !o.status);
-  const sec = (title, list, sub) => h('section', { style: { 'margin-bottom': '22px' } },
+  const keys = ctx.WORK_KEYS;
+  const act = ctx.active();
+  let dragged = null;
+  const cols = keys.map(k => {
+    const list = act.filter(o => o.status === k).sort(bySla(ctx));
+    const body = h('div', { class: 'col-b' }, list.map(o => {
+      const c = orderCard(o, ctx, { draggable: true, extra: checklistBox(ctx, o, k) });
+      c.addEventListener('dragstart', e => { dragged = o; c.classList.add('dragging'); e.dataTransfer.effectAllowed = 'move'; e.dataTransfer.setData('text/plain', o.id); });
+      c.addEventListener('dragend', () => { c.classList.remove('dragging'); });
+      return c;
+    }), list.length ? null : h('div', { class: 'empty', style: { padding: '18px 6px', 'font-size': '13px' } }, 'ריק'));
+    const col = h('div', { class: 'col', style: { '--sc': statusColor(k) }, dataset: { key: k } },
+      h('div', { class: 'col-h' }, h('span', { class: 'dot' }), statusLabel(k), h('span', { class: 'n' }, list.length)), body);
+    col.addEventListener('dragover', e => { if (dragged && statusKey(dragged) !== k) { e.preventDefault(); col.classList.add('drop'); } });
+    col.addEventListener('dragleave', e => { if (!col.contains(e.relatedTarget)) col.classList.remove('drop'); });
+    col.addEventListener('drop', async e => { e.preventDefault(); col.classList.remove('drop'); const o = dragged; dragged = null; if (o) await ctx.changeStatus(o, k); });
+    return col;
+  });
+
+  const diffs = act.filter(o => collection(o).key === 'diff');
+  const unassigned = act.filter(o => !o.status);
+  const sec = (title, list, sub) => h('section', { style: { 'margin-top': '26px' } },
     h('h2', { style: { 'font-size': '16px', margin: '0 0 10px' } }, title, ' ', h('span', { style: { color: 'var(--muted)', 'font-weight': '500' } }, `(${list.length})`), sub ? h('span', { style: { color: 'var(--muted)', 'font-weight': '400', 'font-size': '13px' } }, ` · ${sub}`) : null),
     h('div', { class: 'cards' }, list.map(o => orderCard(o, ctx))));
-  const parts = groups.map(([lvl, title, sub]) => { const l = att.filter(x => x.s.level === lvl).map(x => x.o); return l.length ? sec(title, l, sub) : null; });
-  if (diffs.length) parts.push(sec('הפרש בתשלומים', diffs, 'סכום התשלומים שונה ממחיר המכירה'));
-  if (unassigned.length) parts.push(sec('ממתינות לשיוך סטטוס', unassigned));
+
   return h('div', null,
-    pageHead('דורש טיפול', `התראה כשנותרו ${ctx.settings.warn_days_1} ו-${ctx.settings.warn_days_2} ימי עסקים להתחייבות של ${ctx.settings.sla_days} ימים`, [], crumbTo('#/', 'לוח בקרה')),
-    parts.some(Boolean) ? parts : h('div', { class: 'card empty' }, 'הכול בזמן. אין הזמנות שדורשות טיפול.'));
+    pageHead('דורש טיפול', `סמנו את הבדיקות בכל הזמנה כדי לאפשר מעבר לשלב הבא. כתום: נותרו ${ctx.settings.warn_days_1} ימים או פחות לאספקה · אדום: ${ctx.settings.warn_days_2} ימים או פחות.`,
+      [h('a', { class: 'btn btn-ghost', href: '#/board' }, icon('board', 16), 'לוח עבודה מלא')], crumbTo('#/', 'לוח בקרה')),
+    h('div', { class: 'board-wrap' }, h('div', { class: 'board' }, cols)),
+    diffs.length ? sec('הפרש בתשלומים', diffs, 'סכום התשלומים שונה ממחיר המכירה') : null,
+    unassigned.length ? sec('ממתינות לשיוך סטטוס', unassigned) : null);
 }
 
 // ===================================================================== BOARD
@@ -237,6 +266,7 @@ const EVENT_TEXT = {
   status: e => [`הועברה ל"${statusLabel(e.to_status || 'unassigned')}"`, e.from_status ? `מ"${statusLabel(e.from_status)}"` : null],
   payment2: e => ['הוזנה השלמת תשלום', `${money(e.details?.amount)}${e.details?.method ? ` · ${e.details.method}` : ''} · ${e.details?.invoice ? 'יצאה חשבונית' : 'ללא חשבונית'}`],
   edit: e => ['עודכנו פרטים', (e.details?.fields || []).map(f => FIELD_LABELS[f] || f).join(', ')],
+  checklist: e => ['עודכנו בדיקות שלב', Object.entries(e.details || {}).map(([k, v]) => `${CHECK_LABELS[k] || k}: ${v ? 'סומן ✓' : 'בוטל'}`).join(' · ')],
   archived: () => ['הועברה לארכיון', null], unarchived: () => ['הוחזרה מהארכיון', null],
   deleted: () => ['הועברה לסל המחזור', null], restored: () => ['שוחזרה מסל המחזור', null],
 };
@@ -272,7 +302,7 @@ export async function orderPage(ctx, number) {
       crumbTo(o.deleted_at ? '#/trash' : o.archived_at ? '#/archive' : `#/status/${key}`, o.deleted_at ? 'סל מחזור' : o.archived_at ? 'ארכיון' : statusLabel(key)),
       h('div', { class: 'o-id' }, `הזמנה #${o.order_number}`),
       h('h1', null, o.customer_name),
-      h('div', { class: 'chips' }, statusPill(o), collectionPill(o),
+      h('div', { class: 'chips' }, statusPill(o), collectionPill(o), factoryPill(ctx.factoryOf(o)),
         o.archived_at ? h('span', { class: 'pill muted' }, 'בארכיון') : null, o.deleted_at ? h('span', { class: 'pill crit' }, 'בסל המחזור') : null,
         o.is_import ? h('span', { class: 'pill info' }, 'יובאה מהאקסל') : null)),
     h('div', { class: 'actions' }, actions));
@@ -341,6 +371,15 @@ export async function orderPage(ctx, number) {
     kv('מספר הזמנה', `#${o.order_number}`), kv('שם לקוח', o.customer_name), kv('טלפון', phone), kv('דרך מי הגיע', o.source),
     kv('תאריך כניסה', fmtDate(o.entered_at)), kv('נפתחה ע״י', o.created_by_name), kv('עדכון אחרון', `${o.updated_by_name || '—'} · ${fmtDateTime(o.updated_at)}`))));
 
+  // ---- stage checklists
+  const checks = card('בדיקות שלב', h('div', { class: 'card-b' }, Object.entries(CHECKLISTS).map(([k, c]) => {
+    const done = checklistDone(o, k);
+    return h('div', { class: `cl-group${k === key ? ' cur' : ''}` },
+      h('div', { class: 'cl-h' }, statusLabel(k), h('span', { class: `pill ${done ? 'ok' : k === key ? 'warn' : 'muted'}` }, done ? 'הושלם' : c.mode === 'any' ? 'יש לבחור אחד' : 'לא הושלם')),
+      c.items.map(i => h('label', { class: 'check' },
+        h('input', { type: 'checkbox', checked: !!o[i.key], disabled: locked ? true : null, onchange: e => ctx.toggleCheck(o, i.key, e.target.checked) }), i.label)));
+  })), { aside: 'נדרש למעבר לשלב הבא' });
+
   const notes = card('הערות', h('div', { class: 'card-b' }, o.notes ? h('div', { style: { 'white-space': 'pre-wrap', 'line-height': '1.7' } }, o.notes) : h('div', { style: { color: 'var(--muted)' } }, 'אין הערות.')),
     { aside: locked ? null : h('button', { class: 'btn-link', type: 'button', onclick: () => editOrder(ctx, o) }, o.notes ? 'עריכה' : 'הוספה') });
 
@@ -355,7 +394,7 @@ export async function orderPage(ctx, number) {
     o.status ? stepper : h('div', { class: 'notice' }, icon('alert', 18), 'להזמנה הזו עדיין אין סטטוס. בחרו סטטוס מתוך "שינוי סטטוס" למעלה.'),
     h('div', { class: 'o-grid' },
       h('div', { class: 'o-col' }, details, payments, history),
-      h('div', { class: 'o-col' }, slaCard, customer, notes)));
+      h('div', { class: 'o-col' }, slaCard, checks, customer, notes)));
 }
 
 // ---------- edit modal ----------
@@ -449,10 +488,10 @@ export function newOrder(ctx) {
         withErr(field('עלות יהלומים', moneyInput('n_diam', 0)), 'cost_diamonds'),
         withErr(field('מחיר מכירה', moneyInput('n_sale', ''), { hint: 'כולל מע"מ' }), 'sale_price'))), { cls: 'form-sec' }),
     card('תשלום בפתיחת ההזמנה', h('div', { class: 'card-b' },
-      h('p', { style: { margin: 0, color: 'var(--muted)', 'font-size': '13px' } }, 'חובה למלא לפני פתיחת ההזמנה. אם לא שולמה מקדמה, הזינו 0.'),
+      h('p', { style: { margin: 0, color: 'var(--muted)', 'font-size': '13px' } }, 'חובה למלא לפני פתיחת ההזמנה. אם לא שולמה מקדמה, הזינו 0. לא ניתן לפתוח הזמנה לפני שיצאה חשבונית.'),
       withErr(field('כמה שולם?', moneyInput('n_p1', ''), { req: true, hint: 'בשקלים' }), 'payment1_amount'),
       withErr(field('איך שולם?', methodChips('n_p1m', null), { req: true, hint: 'חובה אם הסכום גדול מ-0' }), 'payment1_method'),
-      h('label', { class: 'check' }, h('input', { type: 'checkbox', id: 'n_p1i' }), 'יצאה חשבונית')), { cls: 'form-sec' }),
+      (() => { const w = h('div', { class: 'field field-check' }, h('label', { class: 'check' }, h('input', { type: 'checkbox', id: 'n_p1i' }), 'יצאה חשבונית', h('span', { class: 'req' }, ' *')), errFor('payment1_invoice')); return w; })()), { cls: 'form-sec' }),
     card('הערות', h('div', { class: 'card-b' }, field('הערות', h('textarea', { id: 'n_notes', rows: 3 }))), { cls: 'form-sec' }));
 
   const submit = h('button', { class: 'btn btn-primary', type: 'submit', style: { width: '100%', padding: '11px' } }, 'פתיחת הזמנה');
@@ -584,7 +623,7 @@ export async function stats(ctx) {
       kpi('עמידה בזמני אספקה', delivered.length ? pct(onTime / delivered.length) : '—', delivered.length ? `${onTime} מתוך ${delivered.length} שנמסרו` : 'אין מסירות בתקופה')),
     h('div', { class: 'kpis' },
       kpi('הזמנות פעילות כעת', act.length, null),
-      kpi('באיחור כעת', lateNow, lateNow ? h('a', { class: 'btn-link', href: '#/attention' }, 'לרשימה') : 'הכול בזמן'),
+      kpi('באיחור כעת', lateNow, lateNow ? h('a', { class: 'btn-link', href: '#/board' }, 'ללוח העבודה') : 'הכול בזמן'),
       kpi('יתרות פתוחות', money0(openBal), 'בהזמנות פעילות'),
       kpi('ממוצע ימי עסקים עד מסירה', delivered.length ? (sum(delivered, s => s.elapsed) / delivered.length).toFixed(1) : '—', `יעד: ${ctx.settings.sla_days}`)),
     h('div', { class: 'panels', style: { 'grid-template-columns': 'minmax(0,1.4fr) minmax(0,1fr)' } },
@@ -633,13 +672,14 @@ export function settingsPage(ctx) {
       field('אחוז מע"מ', h('input', { id: 's_vat', type: 'number', step: '0.1', min: '0', max: '99', value: Math.round(s.vat_rate * 1000) / 10, dir: 'ltr' }), { hint: 'מחיר לפני מע"מ = מחיר ÷ (1 + מע"מ)' }),
       field('התחייבות אספקה (ימי עסקים)', h('input', { id: 's_sla', type: 'number', min: '1', value: s.sla_days, dir: 'ltr' })),
       field('התראה ראשונה כשנותרו', h('input', { id: 's_w1', type: 'number', min: '0', value: s.warn_days_1, dir: 'ltr' }), { hint: 'ימים' }),
-      field('התראה דחופה כשנותרו', h('input', { id: 's_w2', type: 'number', min: '0', value: s.warn_days_2, dir: 'ltr' }), { hint: 'ימים' })),
+      field('התראה דחופה כשנותרו', h('input', { id: 's_w2', type: 'number', min: '0', value: s.warn_days_2, dir: 'ltr' }), { hint: 'ימים' }),
+      field('זמן מקסימלי במפעל', h('input', { id: 's_fac', type: 'number', min: '1', value: s.factory_days ?? 5, dir: 'ltr' }), { hint: 'ימי עסקים · מעבר לזה מסומן כחריגה' })),
     msg,
     h('div', null, h('button', { class: 'btn btn-primary', type: 'submit' }, 'שמירת הגדרות')));
   f.addEventListener('submit', async e => {
     e.preventDefault();
-    const p = { vat_rate: (num(f.querySelector('#s_vat').value) ?? 18) / 100, sla_days: num(f.querySelector('#s_sla').value), warn_days_1: num(f.querySelector('#s_w1').value), warn_days_2: num(f.querySelector('#s_w2').value) };
-    if (!(p.sla_days > 0) || p.warn_days_1 == null || p.warn_days_2 == null || p.vat_rate < 0 || p.vat_rate >= 1) { msg.textContent = 'יש להזין ערכים תקינים בכל השדות.'; msg.hidden = false; return; }
+    const p = { vat_rate: (num(f.querySelector('#s_vat').value) ?? 18) / 100, sla_days: num(f.querySelector('#s_sla').value), warn_days_1: num(f.querySelector('#s_w1').value), warn_days_2: num(f.querySelector('#s_w2').value), factory_days: num(f.querySelector('#s_fac').value) };
+    if (!(p.sla_days > 0) || !(p.factory_days > 0) || p.warn_days_1 == null || p.warn_days_2 == null || p.vat_rate < 0 || p.vat_rate >= 1) { msg.textContent = 'יש להזין ערכים תקינים בכל השדות.'; msg.hidden = false; return; }
     msg.hidden = true;
     try { ctx.settings = { ...ctx.settings, ...(await ctx.api.updateSettings(p)) }; ctx.settings.vat_rate = +ctx.settings.vat_rate; toast('ההגדרות נשמרו'); ctx.render(); } catch (ex) { ctx.handleError(ex); }
   });
