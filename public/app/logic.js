@@ -57,22 +57,41 @@ export function needsPaymentForm(o, to) {
   return crossesReady(o.status, to) && !o.payment2_invoice;
 }
 
-// ---------- Time at the factory ----------
-/** Business days at the factory (current stay + days carried over from earlier stays). null when not at the factory. */
-export function factoryTime(o, settings, holidays, today = todayISO()) {
-  if (o.status !== 'factory' || !o.factory_started_at) return null;
-  const max = settings?.factory_days ?? 5;
-  const days = (+o.factory_days_carry || 0) + businessDaysBetween(israelDate(o.factory_started_at), today, holidays);
-  return { days, max, over: days > max, level: days > max ? 'late' : days === max ? 'warn' : 'ok' };
+// ---------- Time in a stage (office / factory) ----------
+// Each clocked stage keeps: when the current stay started + business days carried over from earlier stays.
+export const STAGE_CLOCKS = {
+  to_factory: { start: 'office_started_at', carry: 'office_days_carry', maxKey: 'office_days', def: 3, where: 'במשרד', back: 'חזרה למשרד' },
+  factory:    { start: 'factory_started_at', carry: 'factory_days_carry', maxKey: 'factory_days', def: 5, where: 'במפעל', back: 'חזרה למפעל' },
+};
+/** Business days in the current clocked stage (including carried-over days). null when the stage has no clock. */
+export function stageTime(o, settings, holidays, today = todayISO()) {
+  const c = STAGE_CLOCKS[o.status];
+  if (!c || !o[c.start]) return null;
+  const max = settings?.[c.maxKey] ?? c.def;
+  const days = (+o[c.carry] || 0) + businessDaysBetween(israelDate(o[c.start]), today, holidays);
+  return { days, max, where: c.where, over: days > max, level: days > max ? 'late' : days === max ? 'warn' : 'ok' };
 }
-export function factoryShort(f) {
+export function stageShort(f) {
   if (!f) return '';
-  const d = f.days === 0 ? 'נכנסה היום למפעל' : `${f.days} ${f.days === 1 ? 'יום' : 'ימים'} במפעל`;
+  const d = f.days === 0 ? `נכנסה היום ${f.where === 'במפעל' ? 'למפעל' : 'למשרד'}` : `${f.days} ${f.days === 1 ? 'יום' : 'ימים'} ${f.where}`;
   return f.over ? `חריגה · ${d}` : d;
 }
-/** Days of the current factory stay, to carry over when the order leaves the factory. */
-export const factoryStayDays = (o, holidays, today = todayISO()) =>
-  o.factory_started_at ? businessDaysBetween(israelDate(o.factory_started_at), today, holidays) : 0;
+/** Moving into a clocked stage the order was in before: the user chooses to continue or restart the count. */
+export const needsClockChoice = (o, to) => { const c = STAGE_CLOCKS[to]; return !!c && o.status !== to && !!o[c.start]; };
+/** Fields to save with a status move, so the stage clocks stay right. choice: 'continue' | 'restart'. */
+export function clockPatch(o, to, choice, holidays, today = todayISO()) {
+  const patch = {};
+  if (o.status === to) return patch;
+  const leaving = STAGE_CLOCKS[o.status];
+  if (leaving && o[leaving.start]) patch[leaving.carry] = (+o[leaving.carry] || 0) + businessDaysBetween(israelDate(o[leaving.start]), today, holidays);
+  const entering = STAGE_CLOCKS[to];
+  if (entering) {
+    patch[entering.start] = new Date().toISOString();
+    patch[entering.carry] = choice === 'continue' ? (+o[entering.carry] || 0) : 0;
+  }
+  return patch;
+}
+
 export const FIRST_ORDER_NUMBER = 2772;
 
 export const PAYMENT_METHODS = ['מזומן', 'העברה בנקאית', 'אשראי', 'שת"פ', 'פייבוקס', 'ביט', 'אתר'];
