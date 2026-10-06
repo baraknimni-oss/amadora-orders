@@ -203,6 +203,7 @@ export function validateNewOrder(d) {
   if (num(d.payment1_amount) > 0 && !d.payment1_method) e.payment1_method = 'יש לבחור איך שולם.';
   if (!d.payment1_invoice) e.payment1_invoice = 'לא ניתן לפתוח הזמנה לפני שיצאה חשבונית.';
   for (const k of ['sale_price', 'cost_lior', 'cost_diamonds']) if (num(d[k]) != null && num(d[k]) < 0) e[k] = 'הסכום לא יכול להיות שלילי.';
+  if (!e.sale_price && !(num(d.sale_price) > 0)) e.sale_price = 'יש להזין מחיר מכירה לפני פתיחת ההזמנה.';
   return e;
 }
 export function validatePayment2(d, { requireInvoice = false } = {}) {
@@ -217,6 +218,7 @@ export function validatePayment2(d, { requireInvoice = false } = {}) {
 export function guardRow(row, prev) {
   if (!row.customer_name?.trim()) return 'יש להזין שם לקוח.';
   if (!prev && !row.is_import && num(row.payment1_amount) == null) return 'יש להזין כמה שולם בפתיחת ההזמנה (אפשר להזין 0).';
+  if (!prev && !row.is_import && !(num(row.sale_price) > 0)) return 'לא ניתן לפתוח הזמנה בלי מחיר מכירה.';
   if (!prev && !row.is_import && !row.payment1_invoice) return 'לא ניתן לפתוח הזמנה לפני שיצאה חשבונית. יש לסמן "יצאה חשבונית".';
   if (row.stones_inserted && row.stones_not_needed) return 'יש לבחור רק אחד: "הכנסת אבנים" או "אין צורך בהכנסת אבנים".';
   if (prev && row.status !== prev.status) {
