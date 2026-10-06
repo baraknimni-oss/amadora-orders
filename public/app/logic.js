@@ -15,6 +15,58 @@ export const statusInfo = keyOrOrder => STATUS_BY_KEY[typeof keyOrOrder === 'str
 export const statusLabel = k => { const s = statusInfo(k); return s.group && s.key !== 'ready' && s.key !== 'with_customer' ? `${s.group} – ${s.name}` : s.name; };
 export const nextStatus = o => { const i = STATUSES.findIndex(s => s.key === o.status); return i >= 0 && i < STATUSES.length - 1 ? STATUSES[i + 1] : (o.status ? null : STATUSES[0]); };
 export const NEEDS_PAYMENT2 = new Set(['ready', 'with_customer']);
+export const stepOf = k => STATUS_BY_KEY[k || 'unassigned']?.step ?? 0;
+
+// ---------- Stage checklists (מסך "דורש טיפול") ----------
+// mode 'any': at least one item; 'all': every item. exclusive: ticking one clears the others.
+export const CHECKLISTS = {
+  to_factory: { mode: 'any', exclusive: true, gateStep: 3, items: [
+    { key: 'stones_inserted', label: 'הכנסת אבנים' }, { key: 'stones_not_needed', label: 'אין צורך בהכנסת אבנים' }] },
+  returned: { mode: 'all', gateStep: 5, items: [
+    { key: 'check_jewelry', label: 'בדיקת התכשיט' }, { key: 'check_sizes', label: 'מידות' }, { key: 'check_gold_color', label: 'צבע זהב' }] },
+  ready: { mode: 'all', gateStep: 6, items: [{ key: 'pickup_coordinated', label: 'תיאום איסוף/משלוח' }] },
+};
+export const CHECK_LABELS = Object.fromEntries(Object.values(CHECKLISTS).flatMap(c => c.items.map(i => [i.key, i.label])));
+export function checklistDone(o, key) {
+  const c = CHECKLISTS[key]; if (!c) return true;
+  return c.mode === 'any' ? c.items.some(i => o[i.key]) : c.items.every(i => o[i.key]);
+}
+const GATE_MSG = {
+  to_factory: 'לפני מעבר למפעל יש לסמן "הכנסת אבנים" או "אין צורך בהכנסת אבנים".',
+  returned: 'לפני מעבר ל"מוכן למסירה" יש לסמן "בדיקת התכשיט", "מידות" ו"צבע זהב".',
+  ready: 'לפני מסירה ללקוח יש לסמן "תיאום איסוף/משלוח".',
+};
+/** Why a status move is not allowed yet (checklists only; payment is handled by its own form). null = allowed.
+ *  Rules apply only when moving forward. The first status given to an imported order is exempt. */
+export function transitionBlock(o, to) {
+  if (!o.status) return null;
+  const from = stepOf(o.status), dest = stepOf(to);
+  if (dest <= from) return null;
+  for (const [key, c] of Object.entries(CHECKLISTS)) if (from < c.gateStep && dest >= c.gateStep && !checklistDone(o, key)) return GATE_MSG[key];
+  return null;
+}
+/** Moving to this status requires the payment form first (completion missing, or no invoice yet). */
+export function needsPaymentForm(o, to) {
+  if (NEEDS_PAYMENT2.has(to) && num(o.payment2_amount) == null) return true;
+  return !!o.status && stepOf(o.status) < 5 && stepOf(to) >= 5 && !o.payment2_invoice;
+}
+
+// ---------- Time at the factory ----------
+/** Business days at the factory (current stay + days carried over from earlier stays). null when not at the factory. */
+export function factoryTime(o, settings, holidays, today = todayISO()) {
+  if (o.status !== 'factory' || !o.factory_started_at) return null;
+  const max = settings?.factory_days ?? 5;
+  const days = (+o.factory_days_carry || 0) + businessDaysBetween(israelDate(o.factory_started_at), today, holidays);
+  return { days, max, over: days > max, level: days > max ? 'late' : days === max ? 'warn' : 'ok' };
+}
+export function factoryShort(f) {
+  if (!f) return '';
+  const d = f.days === 0 ? 'נכנסה היום למפעל' : `${f.days} ${f.days === 1 ? 'יום' : 'ימים'} במפעל`;
+  return f.over ? `חריגה · ${d}` : d;
+}
+/** Days of the current factory stay, to carry over when the order leaves the factory. */
+export const factoryStayDays = (o, holidays, today = todayISO()) =>
+  o.factory_started_at ? businessDaysBetween(israelDate(o.factory_started_at), today, holidays) : 0;
 export const FIRST_ORDER_NUMBER = 2772;
 
 export const PAYMENT_METHODS = ['מזומן', 'העברה בנקאית', 'אשראי', 'שת"פ', 'פייבוקס', 'ביט', 'אתר'];
@@ -124,11 +176,13 @@ export function validateNewOrder(d) {
   if (num(d.payment1_amount) == null) e.payment1_amount = 'יש להזין כמה שולם (אפשר 0).';
   else if (num(d.payment1_amount) < 0) e.payment1_amount = 'הסכום לא יכול להיות שלילי.';
   if (num(d.payment1_amount) > 0 && !d.payment1_method) e.payment1_method = 'יש לבחור איך שולם.';
+  if (!d.payment1_invoice) e.payment1_invoice = 'לא ניתן לפתוח הזמנה לפני שיצאה חשבונית.';
   for (const k of ['sale_price', 'cost_lior', 'cost_diamonds']) if (num(d[k]) != null && num(d[k]) < 0) e[k] = 'הסכום לא יכול להיות שלילי.';
   return e;
 }
-export function validatePayment2(d) {
+export function validatePayment2(d, { requireInvoice = false } = {}) {
   const e = {};
+  if (requireInvoice && !d.payment2_invoice) e.payment2_invoice = 'לפני מעבר ל"מוכן למסירה" יש לסמן שיצאה חשבונית.';
   if (num(d.payment2_amount) == null) e.payment2_amount = 'יש להזין כמה נותר לשלם (אפשר 0).';
   else if (num(d.payment2_amount) < 0) e.payment2_amount = 'הסכום לא יכול להיות שלילי.';
   if (num(d.payment2_amount) > 0 && !d.payment2_method) e.payment2_method = 'יש לבחור איך שולם.';
@@ -138,6 +192,14 @@ export function validatePayment2(d) {
 export function guardRow(row, prev) {
   if (!row.customer_name?.trim()) return 'יש להזין שם לקוח.';
   if (!prev && !row.is_import && num(row.payment1_amount) == null) return 'יש להזין כמה שולם בפתיחת ההזמנה (אפשר להזין 0).';
+  if (!prev && !row.is_import && !row.payment1_invoice) return 'לא ניתן לפתוח הזמנה לפני שיצאה חשבונית. יש לסמן "יצאה חשבונית".';
+  if (row.stones_inserted && row.stones_not_needed) return 'יש לבחור רק אחד: "הכנסת אבנים" או "אין צורך בהכנסת אבנים".';
+  if (prev && row.status !== prev.status) {
+    const block = transitionBlock({ ...row, status: prev.status }, row.status);
+    if (block) return block;
+    if (prev.status && stepOf(prev.status) < 5 && stepOf(row.status) >= 5 && num(row.payment2_amount) != null && !row.payment2_invoice)
+      return 'לפני מעבר ל"מוכן למסירה" יש לסמן שיצאה חשבונית על השלמת התשלום.';
+  }
   if (prev && !row.is_import && num(row.payment1_amount) == null) return 'לא ניתן למחוק את סכום המקדמה (אפשר להזין 0).';
   if (num(row.payment1_amount) > 0 && !row.payment1_method) return 'יש לבחור איך שולמה המקדמה.';
   if (NEEDS_PAYMENT2.has(row.status) && num(row.payment2_amount) == null) return 'לפני מעבר ל"מוכן למסירה" יש להזין את השלמת התשלום: כמה נותר לשלם, איך שולם והאם יצאה חשבונית.';
