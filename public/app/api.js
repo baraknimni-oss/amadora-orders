@@ -136,7 +136,7 @@ function demoSeed() {
     is_import: false, created_by_name: 'דוגמה', source: 'אינסטגרם', ...extra,
   });
   const rows = [...imp,
-    ex(2772, 1, 'לקוחה לדוגמה א׳', 'טבעת סוליטר 1.00 קראט, זהב לבן 14K', 'new', 6900, 3450, 'העברה בנקאית'),
+    ex(2772, 1, 'לקוחה לדוגמה א׳', 'טבעת סוליטר 1.00 קראט, זהב לבן 14K', 'to_factory', 6900, 3450, 'העברה בנקאית'),
     ex(2773, 6, 'לקוחה לדוגמה ב׳', 'עגילי טניס 1.5 קראט', 'to_factory', 5200, 2600, 'ביט'),
     ex(2774, 12, 'לקוח לדוגמה ג׳', 'טבעת נישואין חרוטה', 'factory', 2400, 1200, 'אשראי', { stones_not_needed: true, factory_started_at: new Date(Date.now() - 3 * 86400000).toISOString() }),
     ex(2775, 17, 'לקוחה לדוגמה ד׳', 'שרשרת אות + יהלום 0.10', 'factory', 1900, 950, 'מזומן', { stones_inserted: true, factory_started_at: new Date(Date.now() - 9 * 86400000).toISOString() }),
@@ -184,7 +184,7 @@ class Demo {
   async events(id) { return this.clone(this.evts.filter(e => e.order_id === id)).reverse(); }
   async statusEvents() { return this.clone(this.evts.filter(e => e.type === 'status')); }
   async createOrder(d) {
-    const row = { id: uid(), is_import: false, status: 'new', cost_lior: 0, cost_diamonds: 0, sale_price: 0, payment1_invoice: false, payment2_invoice: false,
+    const row = { id: uid(), is_import: false, status: 'to_factory', cost_lior: 0, cost_diamonds: 0, sale_price: 0, payment1_invoice: false, payment2_invoice: false,
       stones_inserted: false, stones_not_needed: false, check_jewelry: false, check_sizes: false, check_gold_color: false, pickup_coordinated: false,
       factory_started_at: null, factory_days_carry: 0,
       entered_at: todayISO(), description: '', created_at: new Date().toISOString(), ...d };
@@ -198,6 +198,7 @@ class Demo {
   async updateOrder(id, patch) {
     const i = this.orders.findIndex(o => o.id === id); if (i < 0) throw new Error('ההזמנה לא נמצאה.');
     const prev = this.orders[i], row = { ...prev, ...patch, updated_at: new Date().toISOString() };
+    if (row.status === 'new') row.status = 'to_factory'; // removed stage
     const err = guardRow(row, prev); if (err) throw new Error(err);
     if (row.order_number !== prev.order_number && this.orders.some(o => o.order_number === row.order_number)) throw new Error('מספר ההזמנה הזה כבר קיים.');
     if (row.status !== prev.status) row.status_changed_at = row.updated_at;
