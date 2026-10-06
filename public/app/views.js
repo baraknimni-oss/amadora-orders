@@ -105,7 +105,7 @@ export function statusList(ctx, key) {
     key === 'returned' ? h('div', { class: 'notice' }, icon('alert', 18), `לפני מעבר ל"${next.name}" יש לסמן את בדיקות השלב (במסך "דורש טיפול" או בדף ההזמנה), להזין את השלמת התשלום ולסמן שיצאה חשבונית.`) : null,
     key === 'to_factory' || key === 'ready' ? h('div', { class: 'notice' }, icon('alert', 18), `לפני מעבר ל"${next.name}" יש לסמן את בדיקות השלב במסך "דורש טיפול" או בדף ההזמנה.`) : null,
     list.length ? h('div', { class: 'cards' }, list.map(o => orderCard(o, ctx)))
-      : h('div', { class: 'card empty' }, 'אין הזמנות בשלב הזה.', key === 'new' ? h('div', { style: { 'margin-top': '10px' } }, h('a', { class: 'btn btn-primary btn-sm', href: '#/orders/new' }, 'פתיחת הזמנה חדשה')) : null));
+      : h('div', { class: 'card empty' }, 'אין הזמנות בשלב הזה.', key === 'to_factory' ? h('div', { style: { 'margin-top': '10px' } }, h('a', { class: 'btn btn-primary btn-sm', href: '#/orders/new' }, 'פתיחת הזמנה חדשה')) : null));
 }
 
 // ===================================================================== ATTENTION (work board with stage checklists)
@@ -516,7 +516,7 @@ export function newOrder(ctx) {
   const paint = () => {
     const d = read(), f = financials(d, vat), rest = Math.max(0, f.sale - (d.payment1_amount || 0));
     sumBox.replaceChildren(
-      kv('מספר הזמנה', `#${nextNum}`), kv('סטטוס פתיחה', statusLabel('new')),
+      kv('מספר הזמנה', `#${nextNum}`), kv('סטטוס פתיחה', statusLabel('to_factory')),
       kv('מחיר מכירה', money(f.sale), { big: true }), kv('לפני מע"מ', money(f.preVat)), kv('עלויות', money(f.costs)), kv('רווח', `${money(f.profit)} · ${pct(f.margin)}`),
       kv('מקדמה', d.payment1_amount == null ? null : money(d.payment1_amount)), kv('יתרה לגבייה', money(rest), { cls: 'total' }),
       kv('יעד אספקה', fmtDateLong(sla({ entered_at: d.entered_at }, ctx.settings, ctx.holidays).due)));
@@ -547,7 +547,7 @@ export function newOrder(ctx) {
     }
   });
   setTimeout(() => form.querySelector('#n_name')?.focus(), 30);
-  return h('div', null, pageHead('הזמנה חדשה', `המספר ייקבע אוטומטית בשמירה (#${nextNum}). ההזמנה תיפתח בשלב "${statusLabel('new')}".`, [], crumbTo('#/', 'לוח בקרה')), form);
+  return h('div', null, pageHead('הזמנה חדשה', `המספר ייקבע אוטומטית בשמירה (#${nextNum}). ההזמנה תיפתח בשלב "${statusLabel('to_factory')}".`, [], crumbTo('#/', 'לוח בקרה')), form);
 }
 
 // ===================================================================== STATS
