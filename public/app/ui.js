@@ -1,5 +1,5 @@
 // Small DOM toolkit + shared components.
-import { statusInfo, statusLabel, collection, sla, slaShort, SLA_TONE, money0, matchesQuery } from './logic.js';
+import { statusInfo, statusLabel, collection, sla, slaShort, SLA_TONE, money0, matchesQuery, factoryTime, factoryShort } from './logic.js';
 
 export function h(tag, props, ...kids) {
   const el = document.createElement(tag);
@@ -61,10 +61,14 @@ export function statusPill(o) {
 }
 export function collectionPill(o) { const c = collection(o); return h('span', { class: `pill ${c.tone}` }, c.label); }
 export function slaPill(s) { return s ? h('span', { class: `pill ${SLA_TONE[s.level]}` }, slaShort(s)) : null; }
+export function factoryPill(f) {
+  return f ? h('span', { class: `pill ${f.over ? 'late' : f.level === 'warn' ? 'warn' : 'info'}`, title: `יעד: עד ${f.max} ימי עסקים במפעל` }, factoryShort(f)) : null;
+}
 
 // ---------- order card ----------
-export function orderCard(o, ctx, { draggable = false } = {}) {
+export function orderCard(o, ctx, { draggable = false, extra = null } = {}) {
   const s = sla(o, ctx.settings, ctx.holidays, ctx.today);
+  const f = factoryTime(o, ctx.settings, ctx.holidays, ctx.today);
   const card = h('article', {
     class: `ocard lvl-${s?.level || 'ok'}`, tabindex: '0', role: 'link', 'aria-label': `הזמנה ${o.order_number} – ${o.customer_name}`,
     draggable: draggable ? 'true' : null, dataset: { id: o.id },
@@ -74,7 +78,9 @@ export function orderCard(o, ctx, { draggable = false } = {}) {
     h('div', { class: 'oc-top' }, h('span', { class: 'oc-num' }, `#${o.order_number}`), slaPill(s)),
     h('div', { class: 'oc-name' }, o.customer_name),
     h('div', { class: 'oc-desc' }, o.description || '—'),
+    f ? h('div', { class: 'oc-fac' }, factoryPill(f), h('span', { class: 'oc-fac-max' }, `יעד: עד ${f.max} ימים`)) : null,
     h('div', { class: 'oc-foot' }, h('span', { class: 'oc-price' }, +o.sale_price ? money0(o.sale_price) : 'ללא מחיר'), collectionPill(o)),
+    extra,
   );
   return card;
 }
