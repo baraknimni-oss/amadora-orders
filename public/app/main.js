@@ -3,7 +3,7 @@ import { h, icon, toast, modal, field, moneyInput, methodChips, readRadio, searc
 import {
   STATUSES, statusLabel, statusKey, todayISO, sla, urgency, collection, money, money0,
   suggestedRemainder, validatePayment2, num, fmtDate, CHECKLISTS, transitionBlock, needsPaymentForm,
-  factoryTime, factoryStayDays, stepOf,
+  factoryTime, factoryStayDays, crossesReady,
 } from './logic.js';
 import * as V from './views.js';
 
@@ -105,7 +105,7 @@ ctx.toggleCheck = async (o, key, value) => {
 
 ctx.openPayment2 = (o, thenStatus = null, extra = {}) => new Promise(resolve => {
   const suggested = suggestedRemainder(o);
-  const requireInvoice = !!thenStatus && !!o.status && stepOf(o.status) < 5 && stepOf(thenStatus) >= 5;
+  const requireInvoice = !!thenStatus && crossesReady(o.status, thenStatus);
   const errs = h('div');
   const amount = moneyInput('p2_amount', o.payment2_amount ?? '', { placeholder: String(suggested) });
   const body = h('div', { style: { display: 'flex', 'flex-direction': 'column', gap: '14px' } },
