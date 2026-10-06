@@ -1,12 +1,12 @@
 // All screens. Each view receives the shared ctx and returns a DOM node.
-import { h, icon, statusPill, collectionPill, slaPill, factoryPill, orderCard, statusColor, modal, field, moneyInput, methodChips, readRadio, kv, toast, confirmBox } from './ui.js';
+import { h, icon, statusPill, collectionPill, slaPill, stagePill, orderCard, statusColor, modal, field, moneyInput, methodChips, readRadio, kv, toast, confirmBox } from './ui.js';
 import {
   STATUSES, UNASSIGNED, STATUS_BY_KEY, statusKey, statusInfo, statusLabel, nextStatus, NEEDS_PAYMENT2, FIRST_ORDER_NUMBER,
   financials, collection, suggestedRemainder, money, money0, pct, num, sla, slaShort, SLA_TONE, urgency,
   fmtDate, fmtDateLong, fmtDateTime, todayISO, israelDate, businessDaysBetween, weekday, validateNewOrder, validatePayment2,
   FIELD_LABELS, matchesQuery, CHECKLISTS, CHECK_LABELS, checklistDone,
 } from './logic.js';
-import { buildXlsx, download } from './xlsx.js';
+import { buildXlsx, buildWorkbook, download } from './xlsx.js';
 
 const pageHead = (title, sub, actions = [], crumb = null) =>
   h('div', { class: 'page-head' },
@@ -110,14 +110,58 @@ export function statusList(ctx, key) {
 
 // ===================================================================== ATTENTION (work board with stage checklists)
 /** The checklist block shown inside a card. Clicks here must not open the order page. */
+/** Optional cost helper inside a card: a price field + "הכנס" that writes straight into the order's cost field.
+ *  Never required for moving on. */
+function costField(ctx, o, { field: fieldKey, label, what }) {
+  const saved = +o[fieldKey] || 0;
+  const input = h('input', { type: 'number', inputmode: 'decimal', min: '0', step: '0.01', value: saved || '', placeholder: '0', 'aria-label': label });
+  const err = h('div', { class: 'oc-cost-err', hidden: true });
+  const card = () => input.closest('.ocard');
+  // a draggable card blocks selecting text in the field, so turn dragging off while typing
+  input.addEventListener('focus', () => { const c = card(); if (c) c.draggable = false; });
+  input.addEventListener('blur', () => { const c = card(); if (c) c.draggable = true; });
+  const insert = async () => {
+    const v = num(input.value);
+    if (v == null || v < 0) { err.textContent = 'יש להזין סכום תקין.'; err.hidden = false; return; }
+    err.hidden = true;
+    await ctx.save(o.id, { [fieldKey]: v }, `${what} עודכן בהזמנה #${o.order_number}: ${money(v)}`).catch(() => {});
+    ctx.render();
+  };
+  input.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); insert(); } });
+  const f = financials(o, ctx.settings.vat_rate);
+  // the wrapper is a ".field" so the 30-second auto refresh does not redraw the card while typing
+  return h('div', { class: 'oc-cost field' },
+    h('span', { class: 'oc-cost-l' }, label, h('span', { class: 'hint' }, ' · לא חובה')),
+    h('div', { class: 'oc-cost-row' },
+      h('div', { class: 'money-in' }, input),
+      h('button', { class: 'btn btn-ghost btn-sm', type: 'button', onclick: insert }, 'הכנס')),
+    err,
+    h('div', { class: 'oc-cost-s' }, saved ? `נשמר: ${money(saved)}` : 'עדיין לא הוזן',
+      +o.sale_price ? ` · רווח לפי מחיר המכירה: ${money0(f.profit)}` : ''));
+}
+
+/** The checklist block shown inside a card. Clicks here must not open the order page. */
 function checklistBox(ctx, o, key) {
   const c = CHECKLISTS[key]; if (!c) return null;
   const done = checklistDone(o, key);
   const next = STATUSES.find(x => x.step === statusInfo(key).step + 1);
   const stop = e => e.stopPropagation();
+  const extras = [];
+  // "הכנסת אבנים" ticked → optional diamonds price → the order's "יהלומים" cost
+  if (key === 'to_factory' && o.stones_inserted) extras.push(costField(ctx, o, { field: 'cost_diamonds', label: 'מחיר יהלומים', what: 'מחיר היהלומים' }));
+  // "חזר ממפעל": optional "מחיר מפעל" tick → factory price → the order's "ליאור" cost
+  if (key === 'returned') {
+    ctx.costOpen ||= {};
+    const open = ctx.costOpen[o.id] ?? (+o.cost_lior > 0);
+    extras.push(h('label', { class: 'check' },
+      h('input', { type: 'checkbox', checked: open, onchange: e => { ctx.costOpen[o.id] = e.target.checked; ctx.render(); } }), 'מחיר מפעל',
+      h('span', { class: 'hint-locked' }, ' (לא חובה)')));
+    if (open) extras.push(costField(ctx, o, { field: 'cost_lior', label: 'מחיר מפעל', what: 'מחיר המפעל' }));
+  }
   return h('div', { class: 'oc-check', onclick: stop, onkeydown: stop },
   c.items.map(i => h('label', { class: 'check' },
     h('input', { type: 'checkbox', checked: !!o[i.key], onchange: e => ctx.toggleCheck(o, i.key, e.target.checked) }), i.label)),
+  extras,
   next ? h('button', { class: `btn btn-sm ${done ? 'btn-primary' : 'btn-ghost'}`, type: 'button', disabled: done ? null : true,
     onclick: e => { e.stopPropagation(); ctx.changeStatus(o, next.key); } }, `העבר ל"${next.name}"`, icon('arrowL', 14)) : null,
   !done ? h('div', { class: 'hint-locked' }, c.mode === 'any' ? 'יש לסמן אחת מהאפשרויות כדי להתקדם' : 'יש לסמן את כל הבדיקות כדי להתקדם') : null);
@@ -197,40 +241,77 @@ const EXPORT_COLUMNS = [
   { title: 'סה"כ שולם', width: 11, type: 'money' }, { title: 'יתרה', width: 11, type: 'money' }, { title: 'סטטוס גבייה', width: 16 },
   { title: 'דרך מי הגיע', width: 14 }, { title: 'הערות', width: 30 }, { title: 'הערת תשלום מהאקסל', width: 20 }, { title: 'בארכיון', width: 8 },
 ];
+const yn = b => b ? 'כן' : 'לא';
+function exportRow(ctx, o) {
+  const f = financials(o, ctx.settings.vat_rate), c = collection(o), s = ctx.slaOf(o);
+  return [o.order_number, o.entered_at, o.customer_name, o.customer_phone, o.description, statusLabel(statusKey(o)), s?.elapsed, s && !s.stopped ? s.remaining : null,
+    s?.due, o.delivered_at ? israelDate(o.delivered_at) : null, f.sale, Math.round(f.preVat * 100) / 100, +o.cost_lior || 0, +o.cost_diamonds || 0,
+    Math.round(f.profit * 100) / 100, f.margin == null ? '' : pct(f.margin), o.payment1_amount, o.payment1_method, o.payment1_amount == null ? '' : yn(o.payment1_invoice),
+    o.payment2_amount, o.payment2_method, o.payment2_amount == null ? '' : yn(o.payment2_invoice), c.paid, c.balance, c.label, o.source, o.notes,
+    o.legacy_payment_note, yn(o.archived_at)];
+}
 export function exportOrders(ctx, orders, name = 'הזמנות') {
-  const yn = b => b ? 'כן' : 'לא';
-  const rows = orders.map(o => {
-    const f = financials(o, ctx.settings.vat_rate), c = collection(o), s = ctx.slaOf(o);
-    return [o.order_number, o.entered_at, o.customer_name, o.customer_phone, o.description, statusLabel(statusKey(o)), s?.elapsed, s && !s.stopped ? s.remaining : null,
-      s?.due, o.delivered_at ? israelDate(o.delivered_at) : null, f.sale, Math.round(f.preVat * 100) / 100, +o.cost_lior || 0, +o.cost_diamonds || 0,
-      Math.round(f.profit * 100) / 100, f.margin == null ? '' : pct(f.margin), o.payment1_amount, o.payment1_method, o.payment1_amount == null ? '' : yn(o.payment1_invoice),
-      o.payment2_amount, o.payment2_method, o.payment2_amount == null ? '' : yn(o.payment2_invoice), c.paid, c.balance, c.label, o.source, o.notes,
-      o.legacy_payment_note, yn(o.archived_at)];
-  });
+  const rows = orders.map(o => exportRow(ctx, o));
   download(buildXlsx(name, EXPORT_COLUMNS, rows), `${name}-${todayISO()}.xlsx`);
   toast(`יוצאו ${rows.length} הזמנות לאקסל`);
 }
 
 export function allOrders(ctx) {
   const st = ctx.listState ||= { status: 'all', coll: 'all', archived: false, sort: 'order_number', dir: -1 };
+  st.sel ||= new Set();
   if (ctx.searchQuery != null) { st.q = ctx.searchQuery; ctx.searchQuery = null; }
   const tableBox = h('div');
+  const bulkBox = h('div');
   const countEl = h('span', { class: 'sub' });
   const q = h('input', { class: 'input', type: 'search', placeholder: 'סינון לפי שם, מספר, טלפון או פירוט', value: st.q || '', style: { 'max-width': '300px' }, 'aria-label': 'סינון' });
+  const selAllBtn = h('button', { class: 'btn btn-ghost', type: 'button' });
 
   const filtered = () => ctx.orders.filter(o => !o.deleted_at && (st.archived || !o.archived_at)
     && (st.status === 'all' || statusKey(o) === st.status)
     && (st.coll === 'all' || collection(o).key === st.coll || (st.coll === 'open' && collection(o).balance > 0.5))
     && matchesQuery(o, st.q));
   const val = (o, k) => k === 'sla' ? urgency(ctx.slaOf(o)) : k === 'sale_price' ? +o.sale_price : k === 'status' ? (statusInfo(o).step) : (o[k] ?? '');
+  const selected = () => ctx.orders.filter(o => st.sel.has(o.id));
+  // after a bulk action: clear the selection only if the action actually ran
+  const act = async run => { const list = selected(); if (!list.length) return; const ok = await run(list); if (ok !== false) { st.sel.clear(); ctx.render(); } };
+
+  const drawBulk = rows => {
+    const n = st.sel.size, all = rows.length > 0 && rows.every(o => st.sel.has(o.id));
+    selAllBtn.textContent = all ? 'ביטול סימון' : `סימון הכל (${rows.length})`;
+    selAllBtn.disabled = !rows.length;
+    selAllBtn.onclick = () => { if (all) st.sel.clear(); else rows.forEach(o => st.sel.add(o.id)); draw(); };
+    if (!n) { bulkBox.replaceChildren(); return; }
+    const statusSel = h('select', { class: 'input', style: { width: 'auto' }, 'aria-label': 'העברת ההזמנות שנבחרו לסטטוס',
+      onchange: e => { const v = e.target.value; e.target.value = ''; if (v) act(list => ctx.bulkStatus(list, v)); } },
+    h('option', { value: '' }, 'העברה לסטטוס…'), STATUSES.map(x => h('option', { value: x.key }, `${x.step}. ${statusLabel(x.key)}`)));
+    bulkBox.replaceChildren(h('div', { class: 'bulk-bar', role: 'region', 'aria-label': 'פעולות על ההזמנות שנבחרו' },
+      h('b', null, `נבחרו ${plural(n, 'הזמנה', 'הזמנות')}`),
+      statusSel,
+      h('button', { class: 'btn btn-ghost btn-sm', type: 'button', onclick: () => act(list => ctx.bulkArchive(list)) }, icon('archive', 16), 'לארכיון'),
+      h('button', { class: 'btn btn-ghost btn-sm', type: 'button', onclick: () => exportOrders(ctx, selected(), 'הזמנות נבחרות') }, icon('download', 16), 'ייצוא לאקסל'),
+      h('button', { class: 'btn btn-danger btn-sm', type: 'button', onclick: () => act(list => ctx.bulkTrash(list)) }, icon('trash', 16), 'מחיקה'),
+      h('button', { class: 'btn-link', type: 'button', style: { 'margin-inline-start': 'auto' }, onclick: () => { st.sel.clear(); draw(); } }, 'ביטול בחירה')));
+  };
+
   const draw = () => {
     const rows = filtered().sort((a, b) => { const x = val(a, st.sort), y = val(b, st.sort); return (x > y ? 1 : x < y ? -1 : 0) * st.dir || b.order_number - a.order_number; });
+    // the selection only ever contains rows the user can currently see
+    const visible = new Set(rows.map(o => o.id));
+    for (const id of [...st.sel]) if (!visible.has(id)) st.sel.delete(id);
     countEl.textContent = plural(rows.length, 'הזמנה', 'הזמנות');
+    drawBulk(rows);
     const th = (label, key, cls = '') => h('th', { class: `${key ? 'sortable' : ''} ${cls}`, onclick: key ? () => { st.dir = st.sort === key ? -st.dir : (key === 'sla' ? 1 : -1); st.sort = key; draw(); } : null, 'aria-sort': st.sort === key ? (st.dir > 0 ? 'ascending' : 'descending') : null },
       label, st.sort === key ? (st.dir > 0 ? ' ↑' : ' ↓') : '');
+    const nSel = rows.filter(o => st.sel.has(o.id)).length;
+    const headChk = h('input', { type: 'checkbox', 'aria-label': 'סימון כל ההזמנות', checked: rows.length > 0 && nSel === rows.length,
+      onchange: e => { if (e.target.checked) rows.forEach(o => st.sel.add(o.id)); else st.sel.clear(); draw(); } });
+    headChk.indeterminate = nSel > 0 && nSel < rows.length;
     tableBox.replaceChildren(rows.length ? h('div', { class: 'card table-wrap' }, h('table', { class: 't' },
-      h('thead', null, h('tr', null, th('#', 'order_number'), th('לקוח', 'customer_name'), th('פירוט', null, 'hide-sm'), th('סטטוס', 'status'), th('אספקה', 'sla'), th('מחיר', 'sale_price', 'num'), th('גבייה', null, 'hide-sm'), th('נכנס', 'entered_at', 'hide-sm'))),
-      h('tbody', null, rows.map(o => h('tr', { class: 'click', onclick: () => ctx.go(`#/order/${o.order_number}`) },
+      h('thead', null, h('tr', null, h('th', { class: 'chk' }, headChk), th('#', 'order_number'), th('לקוח', 'customer_name'), th('פירוט', null, 'hide-sm'), th('סטטוס', 'status'), th('אספקה', 'sla'), th('מחיר', 'sale_price', 'num'), th('גבייה', null, 'hide-sm'), th('נכנס', 'entered_at', 'hide-sm'))),
+      h('tbody', null, rows.map(o => h('tr', { class: `click${st.sel.has(o.id) ? ' sel' : ''}`, onclick: () => ctx.go(`#/order/${o.order_number}`) },
+        h('td', { class: 'chk', onclick: e => e.stopPropagation() },
+          h('input', { type: 'checkbox', 'aria-label': `סימון הזמנה ${o.order_number}`, checked: st.sel.has(o.id),
+            onchange: e => { if (e.target.checked) st.sel.add(o.id); else st.sel.delete(o.id); draw(); } })),
         h('td', { class: 'tnum' }, o.order_number),
         h('td', null, h('b', null, o.customer_name), o.archived_at ? h('span', { class: 'pill muted', style: { 'margin-inline-start': '6px' } }, 'ארכיון') : null),
         h('td', { class: 'clip hide-sm' }, (o.description || '').split('\n')[0]),
@@ -242,10 +323,10 @@ export function allOrders(ctx) {
       : h('div', { class: 'card empty' }, 'לא נמצאו הזמנות שמתאימות לסינון.'));
   };
   q.addEventListener('input', () => { st.q = q.value; draw(); });
-  const act = ctx.orders.filter(o => !o.deleted_at && (st.archived || !o.archived_at));
-  const statusSeg = h('div', { class: 'seg' }, [['all', 'הכול'], ...(act.some(o => !o.status) ? [['unassigned', 'ממתין לשיוך']] : []), ...STATUSES.map(s => [s.key, s.name])].map(([k, label]) =>
+  const actv = ctx.orders.filter(o => !o.deleted_at && (st.archived || !o.archived_at));
+  const statusSeg = h('div', { class: 'seg' }, [['all', 'הכול'], ...(actv.some(o => !o.status) ? [['unassigned', 'ממתין לשיוך']] : []), ...STATUSES.map(s => [s.key, s.name])].map(([k, label]) =>
     h('button', { type: 'button', class: st.status === k ? 'on' : '', onclick: e => { st.status = k; e.currentTarget.parentElement.querySelectorAll('button').forEach(b => b.classList.remove('on')); e.currentTarget.classList.add('on'); draw(); } },
-      label, h('span', { class: 'n' }, k === 'all' ? act.length : act.filter(o => statusKey(o) === k).length))));
+      label, h('span', { class: 'n' }, k === 'all' ? actv.length : actv.filter(o => statusKey(o) === k).length))));
   const collSel = h('select', { class: 'input', style: { width: 'auto' }, 'aria-label': 'סטטוס גבייה', onchange: e => { st.coll = e.target.value; draw(); } },
     [['all', 'כל מצבי הגבייה'], ['open', 'יש יתרה לתשלום'], ['deposit', 'מקדמה שולמה'], ['paid', 'שולם במלואו'], ['diff', 'הפרש בתשלומים'], ['none', 'טרם שולם'], ['unknown', 'תשלום לא הוזן']]
       .map(([v, l]) => h('option', { value: v, selected: st.coll === v ? true : null }, l)));
@@ -254,8 +335,9 @@ export function allOrders(ctx) {
   return h('div', null,
     pageHead('כל ההזמנות', countEl, [h('button', { class: 'btn btn-ghost', type: 'button', onclick: () => exportOrders(ctx, filtered()) }, icon('download', 16), 'ייצוא לאקסל'),
       h('a', { class: 'btn btn-primary', href: '#/orders/new' }, icon('plus', 16), 'הזמנה חדשה')]),
-    h('div', { class: 'toolbar' }, q, collSel, archChk),
+    h('div', { class: 'toolbar' }, q, collSel, archChk, selAllBtn),
     h('div', { class: 'toolbar' }, statusSeg),
+    bulkBox,
     tableBox);
 }
 
@@ -302,7 +384,7 @@ export async function orderPage(ctx, number) {
       crumbTo(o.deleted_at ? '#/trash' : o.archived_at ? '#/archive' : `#/status/${key}`, o.deleted_at ? 'סל מחזור' : o.archived_at ? 'ארכיון' : statusLabel(key)),
       h('div', { class: 'o-id' }, `הזמנה #${o.order_number}`),
       h('h1', null, o.customer_name),
-      h('div', { class: 'chips' }, statusPill(o), collectionPill(o), factoryPill(ctx.factoryOf(o)),
+      h('div', { class: 'chips' }, statusPill(o), collectionPill(o), stagePill(ctx.stageOf(o)),
         o.archived_at ? h('span', { class: 'pill muted' }, 'בארכיון') : null, o.deleted_at ? h('span', { class: 'pill crit' }, 'בסל המחזור') : null,
         o.is_import ? h('span', { class: 'pill info' }, 'יובאה מהאקסל') : null)),
     h('div', { class: 'actions' }, actions));
@@ -552,14 +634,26 @@ export function newOrder(ctx) {
 
 // ===================================================================== STATS
 const MONTHS = ['ינו׳', 'פבר׳', 'מרץ', 'אפר׳', 'מאי', 'יוני', 'יולי', 'אוג׳', 'ספט׳', 'אוק׳', 'נוב׳', 'דצמ׳'];
+const MONTHS_FULL = ['ינואר', 'פברואר', 'מרץ', 'אפריל', 'מאי', 'יוני', 'יולי', 'אוגוסט', 'ספטמבר', 'אוקטובר', 'נובמבר', 'דצמבר'];
+const ym = (y, m) => `${y}-${String(m).padStart(2, '0')}`;
+const monthName = key => { const [y, m] = key.split('-').map(Number); return `${MONTHS_FULL[m - 1]} ${y}`; };
+const shiftMonth = (key, d) => { let [y, m] = key.split('-').map(Number); m += d; while (m < 1) { m += 12; y--; } while (m > 12) { m -= 12; y++; } return ym(y, m); };
+const lastDayOf = key => { const [y, m] = key.split('-').map(Number); return `${key}-${String(new Date(Date.UTC(y, m, 0)).getUTCDate()).padStart(2, '0')}`; };
+/** All months from the first order until today (newest first). */
+function monthRange(ctx) {
+  const first = ctx.orders.filter(o => !o.deleted_at && o.entered_at).map(o => o.entered_at.slice(0, 7)).sort()[0] || ctx.today.slice(0, 7);
+  const out = []; for (let k = ctx.today.slice(0, 7); k >= first; k = shiftMonth(k, -1)) out.push(k);
+  return out;
+}
+
 export async function stats(ctx) {
-  const st = ctx.statsState ||= { period: 'month' };
-  const today = ctx.today, [ty, tm] = today.split('-').map(Number);
-  const ym = (y, m) => `${y}-${String(m).padStart(2, '0')}`;
-  const prev = tm === 1 ? ym(ty - 1, 12) : ym(ty, tm - 1);
-  const inPeriod = d => !d ? false : st.period === 'month' ? d.startsWith(ym(ty, tm)) : st.period === 'prev' ? d.startsWith(prev) : st.period === 'year' ? d.startsWith(String(ty)) : true;
-  const periodName = { month: 'החודש', prev: 'החודש הקודם', year: 'השנה', all: 'כל הזמן' }[st.period];
+  const today = ctx.today, thisMonth = today.slice(0, 7), thisYear = today.slice(0, 4);
+  const st = ctx.statsState ||= { mode: 'month', month: thisMonth, year: thisYear };
+  const months = monthRange(ctx);
+  const years = [...new Set(months.map(k => k.slice(0, 4)))];
   const all = ctx.orders.filter(o => !o.deleted_at);
+  const inPeriod = d => !d ? false : st.mode === 'month' ? d.startsWith(st.month) : st.mode === 'year' ? d.startsWith(st.year) : true;
+  const periodName = st.mode === 'month' ? monthName(st.month) : st.mode === 'year' ? `שנת ${st.year}` : 'כל הזמן';
   const set = all.filter(o => inPeriod(o.entered_at));
   const vat = ctx.settings.vat_rate;
   const fin = set.map(o => financials(o, vat));
@@ -569,24 +663,49 @@ export async function stats(ctx) {
   const act = ctx.active();
   const lateNow = act.map(ctx.slaOf).filter(s => s && s.level === 'late').length;
   const openBal = sum(act.filter(o => o.status), o => Math.max(0, collection(o).balance));
+  const countBy = key => all.filter(o => o.entered_at?.startsWith(key)).length;
 
   const kpi = (k, v, s) => h('div', { class: 'card kpi' }, h('div', { class: 'k' }, k), h('div', { class: 'v' }, v), s ? h('div', { class: 's' }, s) : null);
 
-  // monthly chart (last 12 months)
-  const months = []; for (let i = 11; i >= 0; i--) { let y = ty, m = tm - i; while (m < 1) { m += 12; y--; } months.push({ key: ym(y, m), label: MONTHS[m - 1], y }); }
-  for (const mo of months) { const os = all.filter(o => o.entered_at?.startsWith(mo.key)); mo.count = os.length; mo.rev = sum(os, o => +o.sale_price); }
-  const maxC = Math.max(1, ...months.map(m => m.count));
+  // ---- period picker: month / year / all, with previous-next arrows
+  const set_ = patch => { Object.assign(st, patch); ctx.render(); };
+  const modeSeg = h('div', { class: 'seg' }, [['month', 'לפי חודש'], ['year', 'לפי שנה'], ['all', 'הכול']].map(([k, l]) =>
+    h('button', { type: 'button', class: st.mode === k ? 'on' : '', onclick: () => set_({ mode: k }) }, l)));
+  let picker = null;
+  if (st.mode === 'month') {
+    const i = months.indexOf(st.month);
+    picker = h('div', { class: 'period-pick' },
+      h('button', { class: 'btn btn-ghost btn-sm', type: 'button', 'aria-label': 'החודש הקודם', disabled: i >= months.length - 1 || i < 0 ? true : null, onclick: () => set_({ month: shiftMonth(st.month, -1) }) }, icon('arrowR', 16)),
+      h('select', { class: 'input', 'aria-label': 'בחירת חודש', onchange: e => set_({ month: e.target.value }) },
+        months.map(k => h('option', { value: k, selected: k === st.month ? true : null }, `${monthName(k)} (${countBy(k)})`))),
+      h('button', { class: 'btn btn-ghost btn-sm', type: 'button', 'aria-label': 'החודש הבא', disabled: st.month >= thisMonth ? true : null, onclick: () => set_({ month: shiftMonth(st.month, 1) }) }, icon('arrowL', 16)));
+  } else if (st.mode === 'year') {
+    const i = years.indexOf(st.year);
+    picker = h('div', { class: 'period-pick' },
+      h('button', { class: 'btn btn-ghost btn-sm', type: 'button', 'aria-label': 'השנה הקודמת', disabled: i >= years.length - 1 || i < 0 ? true : null, onclick: () => set_({ year: String(+st.year - 1) }) }, icon('arrowR', 16)),
+      h('select', { class: 'input', 'aria-label': 'בחירת שנה', onchange: e => set_({ year: e.target.value }) },
+        years.map(y => h('option', { value: y, selected: y === st.year ? true : null }, `${y} (${countBy(y)})`))),
+      h('button', { class: 'btn btn-ghost btn-sm', type: 'button', 'aria-label': 'השנה הבאה', disabled: st.year >= thisYear ? true : null, onclick: () => set_({ year: String(+st.year + 1) }) }, icon('arrowL', 16)));
+  }
+
+  // ---- monthly chart: the chosen year, or the 12 months up to the chosen month. Click a bar to open that month.
+  const endKey = st.mode === 'year' ? `${st.year}-12` : st.mode === 'month' ? st.month : thisMonth;
+  const cm = []; for (let i = 11; i >= 0; i--) { const key = shiftMonth(endKey, -i); const [y, m] = key.split('-').map(Number); cm.push({ key, label: MONTHS[m - 1], y }); }
+  for (const mo of cm) { const os = all.filter(o => o.entered_at?.startsWith(mo.key)); mo.count = os.length; mo.rev = sum(os, o => +o.sale_price); }
+  const maxC = Math.max(1, ...cm.map(m => m.count));
   const step = maxC <= 5 ? 1 : maxC <= 10 ? 2 : maxC <= 25 ? 5 : maxC <= 50 ? 10 : Math.ceil(maxC / 50) * 10;
   const top = Math.ceil(maxC / step) * step;
   const grid = []; for (let v = step; v <= top; v += step) grid.push(h('div', { class: 'gridline', style: { bottom: `${(v / top) * 100}%` } }, h('span', null, v)));
   const chart = h('div', null,
-    h('div', { class: 'chart', style: { '--n': months.length }, role: 'img', 'aria-label': 'מספר הזמנות לפי חודש' }, grid,
-      months.map(mo => h('div', { class: 'bcol', tabindex: '0', 'aria-label': `${mo.label} ${mo.y}: ${mo.count} הזמנות` },
+    h('div', { class: 'chart', style: { '--n': cm.length }, role: 'img', 'aria-label': 'מספר הזמנות לפי חודש' }, grid,
+      cm.map(mo => h('div', { class: `bcol${st.mode === 'month' && mo.key === st.month ? ' on' : ''}`, tabindex: '0', 'aria-label': `${mo.label} ${mo.y}: ${mo.count} הזמנות`,
+        style: { cursor: mo.key <= thisMonth ? 'pointer' : 'default' },
+        onclick: () => { if (mo.key <= thisMonth) set_({ mode: 'month', month: mo.key }); } },
         h('i', { style: { height: `${(mo.count / top) * 100}%` } }),
         h('span', { class: 'tip' }, `${mo.label} ${mo.y} · ${plural(mo.count, 'הזמנה', 'הזמנות')} · ${money0(mo.rev)}`)))),
-    h('div', { class: 'chart-x', style: { '--n': months.length } }, months.map(mo => h('span', null, mo.label))));
+    h('div', { class: 'chart-x', style: { '--n': cm.length } }, cm.map(mo => h('span', null, mo.label))));
 
-  // time per stage (completed stages only)
+  // ---- time per stage (completed stages only)
   let stageRows = [];
   try {
     const evs = await ctx.api.statusEvents();
@@ -610,12 +729,24 @@ export async function stats(ctx) {
   const tbl = (heads, rows) => rows.length ? h('div', { class: 'table-wrap' }, h('table', { class: 't' }, h('thead', null, h('tr', null, heads.map((x, i) => h('th', { class: i ? 'num' : '' }, x)))),
     h('tbody', null, rows.map(r => h('tr', null, r.map((x, i) => h('td', { class: i ? 'num' : '' }, x))))))) : h('div', { class: 'empty' }, 'אין נתונים לתקופה.');
 
-  const seg = h('div', { class: 'seg' }, [['month', 'החודש'], ['prev', 'החודש הקודם'], ['year', 'השנה'], ['all', 'הכול']].map(([k, l]) =>
-    h('button', { type: 'button', class: st.period === k ? 'on' : '', onclick: () => { st.period = k; ctx.render(); } }, l)));
+  // ---- every order of the period
+  const periodList = [...set].sort((a, b) => String(b.entered_at).localeCompare(String(a.entered_at)) || b.order_number - a.order_number);
+  const ordersCard = card(`ההזמנות של ${periodName}`, periodList.length ? h('div', { class: 'table-wrap' }, h('table', { class: 't' },
+    h('thead', null, h('tr', null, h('th', null, '#'), h('th', null, 'נכנס'), h('th', null, 'לקוח'), h('th', { class: 'hide-sm' }, 'פירוט'), h('th', null, 'סטטוס'),
+      h('th', { class: 'num' }, 'מחיר'), h('th', { class: 'num hide-sm' }, 'רווח'), h('th', { class: 'hide-sm' }, 'גבייה'))),
+    h('tbody', null, periodList.map(o => { const f = financials(o, vat); return h('tr', { class: 'click', onclick: () => ctx.go(`#/order/${o.order_number}`) },
+      h('td', { class: 'tnum' }, o.order_number), h('td', { class: 'tnum' }, fmtDate(o.entered_at)),
+      h('td', null, h('b', null, o.customer_name), o.archived_at ? h('span', { class: 'pill muted', style: { 'margin-inline-start': '6px' } }, 'ארכיון') : null),
+      h('td', { class: 'clip hide-sm' }, (o.description || '').split('\n')[0]), h('td', null, statusPill(o)),
+      h('td', { class: 'num' }, +o.sale_price ? money0(o.sale_price) : '—'), h('td', { class: 'num hide-sm' }, +o.sale_price ? money0(f.profit) : '—'),
+      h('td', { class: 'hide-sm' }, collectionPill(o))); }))))
+    : h('div', { class: 'empty' }, 'לא נכנסו הזמנות בתקופה הזו.'),
+  { aside: periodList.length ? h('button', { class: 'btn-link', type: 'button', onclick: () => exportOrders(ctx, periodList, `הזמנות ${periodName}`) }, 'ייצוא לאקסל') : null });
 
   return h('div', null,
-    pageHead('סיכום ונתונים', `${periodName} · לפי תאריך כניסת ההזמנה`, [h('button', { class: 'btn btn-ghost', type: 'button', onclick: () => exportOrders(ctx, set, 'הזמנות') }, icon('download', 16), 'ייצוא התקופה לאקסל')]),
-    h('div', { class: 'toolbar' }, seg),
+    pageHead('סיכום ונתונים', `${periodName} · לפי תאריך כניסת ההזמנה`, [
+      h('button', { class: 'btn btn-primary', type: 'button', onclick: () => openReport(ctx) }, icon('download', 16), 'הפקת דוח הזמנות')]),
+    h('div', { class: 'toolbar' }, modeSeg, picker),
     h('div', { class: 'kpis' },
       kpi('הזמנות שנכנסו', set.length, periodName),
       kpi('מחזור מכירות', money0(revenue), `לפני מע"מ ${money0(preVat)}`),
@@ -627,11 +758,181 @@ export async function stats(ctx) {
       kpi('יתרות פתוחות', money0(openBal), 'בהזמנות פעילות'),
       kpi('ממוצע ימי עסקים עד מסירה', delivered.length ? (sum(delivered, s => s.elapsed) / delivered.length).toFixed(1) : '—', `יעד: ${ctx.settings.sla_days}`)),
     h('div', { class: 'panels', style: { 'grid-template-columns': 'minmax(0,1.4fr) minmax(0,1fr)' } },
-      card('הזמנות לפי חודש', h('div', { class: 'card-b' }, chart), { aside: '12 החודשים האחרונים' }),
+      card('הזמנות לפי חודש', h('div', { class: 'card-b' }, chart), { aside: 'לחיצה על חודש פותחת אותו' }),
       card('זמן ממוצע בכל שלב', tbl(['שלב', 'ימי עסקים', 'הזמנות'], stageRows.filter(([, a]) => a.n).map(([s, a]) => [statusLabel(s.key), (a.d / a.n).toFixed(1), a.n])), { aside: 'שלבים שהסתיימו' })),
     h('div', { class: 'panels', style: { 'margin-top': '16px', 'grid-template-columns': 'repeat(2, minmax(0,1fr))' } },
       card('לפי מקור הגעה', tbl(['מקור', 'הזמנות', 'מחזור'], bySource.map(([k, g]) => [k, g.n, money0(g.rev)])), { aside: periodName }),
-      card('תקבולים לפי אמצעי תשלום', tbl(['אמצעי', 'סכום'], [...methods.entries()].sort((a, b) => b[1] - a[1]).map(([k, v]) => [k, money0(v)])), { aside: periodName })));
+      card('תקבולים לפי אמצעי תשלום', tbl(['אמצעי', 'סכום'], [...methods.entries()].sort((a, b) => b[1] - a[1]).map(([k, v]) => [k, money0(v)])), { aside: periodName })),
+    h('div', { style: { 'margin-top': '16px' } }, ordersCard));
+}
+
+// ===================================================================== ORDERS REPORT (דוח הזמנות)
+function reportPresets(ctx) {
+  const t = ctx.today, m = t.slice(0, 7), y = +t.slice(0, 4), mo = +t.slice(5, 7);
+  const qStart = ym(y, Math.floor((mo - 1) / 3) * 3 + 1);
+  const first = ctx.orders.filter(o => !o.deleted_at && o.entered_at).map(o => o.entered_at).sort()[0] || t;
+  return [
+    ['this-month', 'החודש', `${m}-01`, lastDayOf(m)],
+    ['prev-month', 'החודש הקודם', `${shiftMonth(m, -1)}-01`, lastDayOf(shiftMonth(m, -1))],
+    ['quarter', 'הרבעון', `${qStart}-01`, lastDayOf(shiftMonth(qStart, 2))],
+    ['year', 'השנה', `${y}-01-01`, `${y}-12-31`],
+    ['prev-year', 'השנה הקודמת', `${y - 1}-01-01`, `${y - 1}-12-31`],
+    ['all', 'מתחילת הפעילות', first, t],
+  ];
+}
+function reportOrders(ctx, { from, to, basis, archived }) {
+  return ctx.orders.filter(o => {
+    if (o.deleted_at || (!archived && o.archived_at)) return false;
+    const d = basis === 'delivered' ? (o.delivered_at ? israelDate(o.delivered_at) : null) : o.entered_at;
+    return !!d && d >= from && d <= to;
+  }).sort((a, b) => String(a.entered_at).localeCompare(String(b.entered_at)) || a.order_number - b.order_number);
+}
+function reportTotals(ctx, list) {
+  const vat = ctx.settings.vat_rate;
+  const t = { n: list.length, sale: 0, preVat: 0, lior: 0, diam: 0, profit: 0, paid: 0, balance: 0, delivered: 0, onTime: 0 };
+  for (const o of list) {
+    const f = financials(o, vat), c = collection(o), s = ctx.slaOf(o);
+    t.sale += f.sale; t.preVat += f.preVat; t.lior += +o.cost_lior || 0; t.diam += +o.cost_diamonds || 0; t.profit += f.profit;
+    t.paid += c.paid; t.balance += Math.max(0, c.balance);
+    if (o.delivered_at) { t.delivered++; if (s?.onTime) t.onTime++; }
+  }
+  t.margin = t.preVat > 0 ? t.profit / t.preVat : null;
+  return t;
+}
+const r2 = v => Math.round(v * 100) / 100;
+
+function reportWorkbook(ctx, list, opts) {
+  const T = reportTotals(ctx, list);
+  const basisName = opts.basis === 'delivered' ? 'תאריך מסירה ללקוח' : 'תאריך כניסת ההזמנה';
+  const summary = {
+    name: 'סיכום', filter: false,
+    columns: [{ title: 'נתון', width: 30 }, { title: 'כמות', width: 12, type: 'num' }, { title: 'סכום', width: 16, type: 'money' }, { title: 'הערה', width: 30 }],
+    rows: [
+      { bold: true, cells: ['דוח הזמנות · AMADORA'] },
+      ['תקופה', null, null, `${fmtDate(opts.from)} – ${fmtDate(opts.to)}`],
+      ['לפי', null, null, basisName],
+      ['כולל ארכיון', null, null, opts.archived ? 'כן' : 'לא'],
+      ['הופק', null, null, `${fmtDateTime(new Date().toISOString())} · ${ctx.name}`],
+      [],
+      { bold: true, cells: ['הזמנות', T.n] },
+      ['מחזור מכירות (כולל מע"מ)', null, r2(T.sale)],
+      ['מחזור לפני מע"מ', null, r2(T.preVat)],
+      ['עלויות ליאור', null, r2(T.lior)],
+      ['עלויות יהלומים', null, r2(T.diam)],
+      { bold: true, cells: ['רווח', null, r2(T.profit), T.margin == null ? '' : `${pct(T.margin)} מהמחיר לפני מע"מ`] },
+      ['נגבה', null, r2(T.paid)],
+      ['יתרות פתוחות', null, r2(T.balance)],
+      ['נמסרו ללקוח', T.delivered, null, T.delivered ? `${T.onTime} בזמן (${pct(T.onTime / T.delivered)})` : ''],
+      [],
+      { bold: true, cells: ['לפי סטטוס', 'הזמנות', 'מחזור'] },
+      ...[...(list.some(o => !o.status) ? ['unassigned'] : []), ...STATUSES.map(s => s.key)].map(k => {
+        const l = list.filter(o => statusKey(o) === k); return l.length ? [statusLabel(k), l.length, r2(sum(l, o => +o.sale_price))] : null;
+      }).filter(Boolean),
+    ],
+  };
+  const byMonth = new Map();
+  for (const o of list) {
+    const d = opts.basis === 'delivered' ? israelDate(o.delivered_at) : o.entered_at;
+    const k = d.slice(0, 7); (byMonth.get(k) || byMonth.set(k, []).get(k)).push(o);
+  }
+  const monthRow = (label, l) => { const t = reportTotals(ctx, l); return [label, t.n, r2(t.sale), r2(t.preVat), r2(t.lior + t.diam), r2(t.profit), t.margin == null ? '' : pct(t.margin), r2(t.paid), r2(t.balance)]; };
+  const monthly = {
+    name: 'לפי חודש',
+    columns: [{ title: 'חודש', width: 16 }, { title: 'הזמנות', width: 9, type: 'num' }, { title: 'מחזור', width: 13, type: 'money' }, { title: 'לפני מע"מ', width: 13, type: 'money' },
+      { title: 'עלויות', width: 13, type: 'money' }, { title: 'רווח', width: 13, type: 'money' }, { title: 'אחוז רווח', width: 10 }, { title: 'נגבה', width: 13, type: 'money' }, { title: 'יתרה', width: 13, type: 'money' }],
+    rows: [...[...byMonth.keys()].sort().map(k => monthRow(monthName(k), byMonth.get(k))), { bold: true, cells: monthRow('סה"כ', list) }],
+  };
+  const src = new Map(); for (const o of list) { const k = o.source || 'לא צוין'; (src.get(k) || src.set(k, []).get(k)).push(o); }
+  const sources = {
+    name: 'לפי מקור',
+    columns: [{ title: 'מקור', width: 20 }, { title: 'הזמנות', width: 9, type: 'num' }, { title: 'מחזור', width: 13, type: 'money' }, { title: 'רווח', width: 13, type: 'money' }],
+    rows: [...src.entries()].map(([k, l]) => { const t = reportTotals(ctx, l); return [k, t.n, r2(t.sale), r2(t.profit)]; }).sort((a, b) => b[2] - a[2]),
+  };
+  const detailRows = list.map(o => exportRow(ctx, o));
+  const total = EXPORT_COLUMNS.map(() => null); total[0] = 'סה"כ'; total[2] = plural(list.length, 'הזמנה', 'הזמנות');
+  for (const i of [10, 12, 13, 16, 19, 22, 23]) total[i] = r2(sum(detailRows, r => +r[i] || 0));
+  total[11] = r2(T.preVat); total[14] = r2(T.profit); // exact, not a sum of rounded rows
+  const details = { name: 'הזמנות', columns: EXPORT_COLUMNS, rows: [...detailRows, { bold: true, cells: total }] };
+  return buildWorkbook([summary, monthly, sources, details]);
+}
+
+const escHtml = v => String(v ?? '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+function reportPrint(ctx, list, opts) {
+  const T = reportTotals(ctx, list), vat = ctx.settings.vat_rate;
+  const w = window.open('', '_blank');
+  if (!w) { toast('הדפדפן חסם את חלון ההדפסה. יש לאשר חלונות קופצים לאתר הזה.', true); return; }
+  const kpi = (k, v) => `<div class="k"><div>${escHtml(k)}</div><b>${escHtml(v)}</b></div>`;
+  const rows = list.map(o => { const f = financials(o, vat), c = collection(o); return `<tr><td>${o.order_number}</td><td>${fmtDate(o.entered_at)}</td><td>${escHtml(o.customer_name)}</td><td class="d">${escHtml((o.description || '').split('\n')[0])}</td><td>${escHtml(statusLabel(statusKey(o)))}</td><td class="n">${money0(f.sale)}</td><td class="n">${money0(f.profit)}</td><td class="n">${money0(c.paid)}</td><td class="n">${money0(Math.max(0, c.balance))}</td></tr>`; }).join('');
+  w.document.write(`<!doctype html><html lang="he" dir="rtl"><head><meta charset="utf-8"><title>דוח הזמנות ${fmtDate(opts.from)} – ${fmtDate(opts.to)}</title>
+<style>body{font-family:Heebo,Arial,sans-serif;color:#1f1a15;margin:28px;font-size:12px}h1{font-size:20px;margin:0 0 4px}.sub{color:#7a6e60;margin-bottom:18px}
+.kp{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:20px}.k{border:1px solid #e5dccf;border-radius:8px;padding:10px}.k div{color:#7a6e60;font-size:11px}.k b{font-size:17px}
+table{width:100%;border-collapse:collapse}th{background:#f3eadb;text-align:right;padding:6px;font-size:11px}td{padding:6px;border-bottom:1px solid #eee5d8}td.n,th.n{text-align:left;white-space:nowrap}td.d{max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+tfoot td{font-weight:700;border-top:2px solid #c9a46a}.bar{margin-bottom:16px}@media print{.bar{display:none}body{margin:10mm}}</style></head><body>
+<div class="bar"><button onclick="print()">הדפסה / שמירה כ-PDF</button></div>
+<h1>דוח הזמנות · AMADORA</h1><div class="sub">${fmtDate(opts.from)} – ${fmtDate(opts.to)} · לפי ${opts.basis === 'delivered' ? 'תאריך מסירה' : 'תאריך כניסה'} · הופק ${escHtml(fmtDateTime(new Date().toISOString()))}</div>
+<div class="kp">${kpi('הזמנות', T.n)}${kpi('מחזור (כולל מע"מ)', money0(T.sale))}${kpi('לפני מע"מ', money0(T.preVat))}${kpi('רווח', `${money0(T.profit)}${T.margin == null ? '' : ` · ${pct(T.margin)}`}`)}
+${kpi('עלויות', money0(T.lior + T.diam))}${kpi('נגבה', money0(T.paid))}${kpi('יתרות פתוחות', money0(T.balance))}${kpi('נמסרו בזמן', T.delivered ? `${T.onTime} מתוך ${T.delivered}` : '—')}</div>
+<table><thead><tr><th>#</th><th>נכנס</th><th>לקוח</th><th>פירוט</th><th>סטטוס</th><th class="n">מחיר</th><th class="n">רווח</th><th class="n">שולם</th><th class="n">יתרה</th></tr></thead>
+<tbody>${rows || '<tr><td colspan="9">אין הזמנות בטווח.</td></tr>'}</tbody>
+<tfoot><tr><td colspan="5">סה"כ ${T.n} הזמנות</td><td class="n">${money0(T.sale)}</td><td class="n">${money0(T.profit)}</td><td class="n">${money0(T.paid)}</td><td class="n">${money0(T.balance)}</td></tr></tfoot></table>
+<script>setTimeout(()=>print(),400)</script></body></html>`);
+  w.document.close();
+}
+
+function openReport(ctx) {
+  const presets = reportPresets(ctx);
+  const st = ctx.reportState ||= { preset: 'this-month', basis: 'entered', archived: true };
+  const p0 = presets.find(p => p[0] === st.preset) || presets[0];
+  const fromIn = h('input', { class: 'input', type: 'date', value: st.from || p0[2], 'aria-label': 'מתאריך' });
+  const toIn = h('input', { class: 'input', type: 'date', value: st.to || p0[3], 'aria-label': 'עד תאריך' });
+  const preview = h('div', { class: 'report-preview' });
+  const err = h('div', { class: 'form-err', hidden: true });
+  const chips = h('div', { class: 'seg' }, [...presets.map(([k, l]) => [k, l]), ['custom', 'טווח אחר']].map(([k, l]) =>
+    h('button', { type: 'button', class: st.preset === k ? 'on' : '', dataset: { k }, onclick: () => {
+      st.preset = k; const p = presets.find(x => x[0] === k); if (p) { fromIn.value = p[2]; toIn.value = p[3]; }
+      chips.querySelectorAll('button').forEach(b => b.classList.toggle('on', b.dataset.k === k)); paint();
+    } }, l)));
+  const basisSel = h('div', { class: 'chips-in', role: 'radiogroup' }, [['entered', 'תאריך כניסת ההזמנה'], ['delivered', 'תאריך מסירה ללקוח']].map(([v, l]) =>
+    h('label', null, h('input', { type: 'radio', name: 'rep_basis', value: v, checked: st.basis === v, onchange: () => { st.basis = v; paint(); } }), h('span', null, l))));
+  const archChk = h('label', { class: 'check' }, h('input', { type: 'checkbox', checked: st.archived, onchange: e => { st.archived = e.target.checked; paint(); } }), 'כולל הזמנות בארכיון');
+  const opts = () => ({ from: fromIn.value, to: toIn.value, basis: st.basis, archived: st.archived });
+  const valid = () => {
+    const o = opts(), bad = !o.from || !o.to ? 'יש לבחור תאריך התחלה ותאריך סיום.' : o.from > o.to ? 'תאריך ההתחלה מאוחר מתאריך הסיום.' : null;
+    err.textContent = bad || ''; err.hidden = !bad; return !bad;
+  };
+  const paint = () => {
+    st.from = fromIn.value; st.to = toIn.value;
+    if (!valid()) { preview.replaceChildren(); return; }
+    const l = reportOrders(ctx, opts()), T = reportTotals(ctx, l);
+    preview.replaceChildren(
+      kv('הזמנות בטווח', String(T.n)), kv('מחזור (כולל מע"מ)', money0(T.sale)), kv('רווח', `${money0(T.profit)}${T.margin == null ? '' : ` · ${pct(T.margin)}`}`),
+      kv('נגבה', money0(T.paid)), kv('יתרות פתוחות', money0(T.balance), { cls: 'total' }));
+  };
+  const onDate = () => { st.preset = 'custom'; chips.querySelectorAll('button').forEach(b => b.classList.toggle('on', b.dataset.k === 'custom')); paint(); };
+  fromIn.addEventListener('change', onDate); toIn.addEventListener('change', onDate);
+  const body = h('div', { style: { display: 'flex', 'flex-direction': 'column', gap: '14px' } },
+    h('p', { style: { margin: 0, color: 'var(--muted)' } }, 'דוח מלא של ההזמנות בטווח התאריכים: סיכום, פילוח לפי חודש ולפי מקור, וכל פרטי ההזמנות.'),
+    h('div', { class: 'field' }, h('span', null, 'תקופה'), chips),
+    h('div', { class: 'grid-2' }, field('מתאריך', fromIn), field('עד תאריך', toIn)),
+    field('לפי', basisSel),
+    archChk, err,
+    h('div', { class: 'kv', style: { background: 'var(--surface-2)', border: '1px solid var(--line)', 'border-radius': '8px', padding: '2px 14px' } }, preview));
+  const run = fn => () => {
+    if (!valid()) return;
+    const o = opts(), l = reportOrders(ctx, o);
+    if (!l.length) { toast('אין הזמנות בטווח שנבחר.', true); return; }
+    fn(l, o);
+  };
+  modal({
+    title: 'הפקת דוח הזמנות', body, wide: true,
+    actions: [
+      h('button', { class: 'btn btn-primary', type: 'button', onclick: run((l, o) => {
+        download(reportWorkbook(ctx, l, o), `דוח הזמנות ${o.from} עד ${o.to}.xlsx`); toast(`הדוח הופק: ${plural(l.length, 'הזמנה', 'הזמנות')}`);
+      }) }, icon('download', 16), 'הורדה לאקסל'),
+      h('button', { class: 'btn btn-ghost', type: 'button', onclick: run((l, o) => reportPrint(ctx, l, o)) }, 'הדפסה / PDF'),
+    ],
+  });
+  paint();
 }
 
 // ===================================================================== ARCHIVE & TRASH
@@ -673,13 +974,14 @@ export function settingsPage(ctx) {
       field('התחייבות אספקה (ימי עסקים)', h('input', { id: 's_sla', type: 'number', min: '1', value: s.sla_days, dir: 'ltr' })),
       field('התראה ראשונה כשנותרו', h('input', { id: 's_w1', type: 'number', min: '0', value: s.warn_days_1, dir: 'ltr' }), { hint: 'ימים' }),
       field('התראה דחופה כשנותרו', h('input', { id: 's_w2', type: 'number', min: '0', value: s.warn_days_2, dir: 'ltr' }), { hint: 'ימים' }),
+      field('זמן מקסימלי במשרד (לפני משלוח למפעל)', h('input', { id: 's_off', type: 'number', min: '1', value: s.office_days ?? 3, dir: 'ltr' }), { hint: 'ימי עסקים · מעבר לזה מסומן כחריגה' }),
       field('זמן מקסימלי במפעל', h('input', { id: 's_fac', type: 'number', min: '1', value: s.factory_days ?? 5, dir: 'ltr' }), { hint: 'ימי עסקים · מעבר לזה מסומן כחריגה' })),
     msg,
     h('div', null, h('button', { class: 'btn btn-primary', type: 'submit' }, 'שמירת הגדרות')));
   f.addEventListener('submit', async e => {
     e.preventDefault();
-    const p = { vat_rate: (num(f.querySelector('#s_vat').value) ?? 18) / 100, sla_days: num(f.querySelector('#s_sla').value), warn_days_1: num(f.querySelector('#s_w1').value), warn_days_2: num(f.querySelector('#s_w2').value), factory_days: num(f.querySelector('#s_fac').value) };
-    if (!(p.sla_days > 0) || !(p.factory_days > 0) || p.warn_days_1 == null || p.warn_days_2 == null || p.vat_rate < 0 || p.vat_rate >= 1) { msg.textContent = 'יש להזין ערכים תקינים בכל השדות.'; msg.hidden = false; return; }
+    const p = { vat_rate: (num(f.querySelector('#s_vat').value) ?? 18) / 100, sla_days: num(f.querySelector('#s_sla').value), warn_days_1: num(f.querySelector('#s_w1').value), warn_days_2: num(f.querySelector('#s_w2').value), factory_days: num(f.querySelector('#s_fac').value), office_days: num(f.querySelector('#s_off').value) };
+    if (!(p.sla_days > 0) || !(p.factory_days > 0) || !(p.office_days > 0) || p.warn_days_1 == null || p.warn_days_2 == null || p.vat_rate < 0 || p.vat_rate >= 1) { msg.textContent = 'יש להזין ערכים תקינים בכל השדות.'; msg.hidden = false; return; }
     msg.hidden = true;
     try { ctx.settings = { ...ctx.settings, ...(await ctx.api.updateSettings(p)) }; ctx.settings.vat_rate = +ctx.settings.vat_rate; toast('ההגדרות נשמרו'); ctx.render(); } catch (ex) { ctx.handleError(ex); }
   });
