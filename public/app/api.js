@@ -136,8 +136,8 @@ function demoSeed() {
     is_import: false, created_by_name: 'דוגמה', source: 'אינסטגרם', ...extra,
   });
   const rows = [...imp,
-    ex(2772, 1, 'לקוחה לדוגמה א׳', 'טבעת סוליטר 1.00 קראט, זהב לבן 14K', 'to_factory', 6900, 3450, 'העברה בנקאית'),
-    ex(2773, 6, 'לקוחה לדוגמה ב׳', 'עגילי טניס 1.5 קראט', 'to_factory', 5200, 2600, 'ביט'),
+    ex(2772, 1, 'לקוחה לדוגמה א׳', 'טבעת סוליטר 1.00 קראט, זהב לבן 14K', 'to_factory', 6900, 3450, 'העברה בנקאית', { office_started_at: new Date(Date.now() - 1 * 86400000).toISOString() }),
+    ex(2773, 6, 'לקוחה לדוגמה ב׳', 'עגילי טניס 1.5 קראט', 'to_factory', 5200, 2600, 'ביט', { office_started_at: new Date(Date.now() - 6 * 86400000).toISOString() }),
     ex(2774, 12, 'לקוח לדוגמה ג׳', 'טבעת נישואין חרוטה', 'factory', 2400, 1200, 'אשראי', { stones_not_needed: true, factory_started_at: new Date(Date.now() - 3 * 86400000).toISOString() }),
     ex(2775, 17, 'לקוחה לדוגמה ד׳', 'שרשרת אות + יהלום 0.10', 'factory', 1900, 950, 'מזומן', { stones_inserted: true, factory_started_at: new Date(Date.now() - 9 * 86400000).toISOString() }),
     ex(2776, 15, 'לקוחה לדוגמה ה׳', 'צמיד טניס 3 קראט', 'returned', 9800, 4900, 'העברה בנקאית', { stones_inserted: true, check_jewelry: true, factory_started_at: new Date(Date.now() - 12 * 86400000).toISOString(), factory_days_carry: 4 }),
@@ -148,7 +148,7 @@ function demoSeed() {
     payment1_amount: null, payment1_method: null, payment1_invoice: false,
     payment2_amount: null, payment2_method: null, payment2_invoice: false, payment2_at: null, legacy_payment_note: null,
     stones_inserted: false, stones_not_needed: false, check_jewelry: false, check_sizes: false, check_gold_color: false, pickup_coordinated: false,
-    factory_started_at: null, factory_days_carry: 0,
+    factory_started_at: null, factory_days_carry: 0, office_started_at: null, office_days_carry: 0,
     archived_at: null, deleted_at: null, delivered_at: null, created_at: new Date().toISOString(), updated_at: new Date().toISOString(),
     status_changed_at: new Date().toISOString(), updated_by_name: r.created_by_name, ...r,
   }));
@@ -169,7 +169,7 @@ class Demo {
         this.evts.push({ id: this.evts.length + 1, order_id: o.id, at, actor_name: 'דוגמה', type: 'status', from_status: STATUSES[i - 1].key, to_status: STATUSES[i].key });
       }
     }
-    this.settings = { id: 1, vat_rate: 0.18, sla_days: 14, warn_days_1: 6, warn_days_2: 3, factory_days: 5 };
+    this.settings = { id: 1, vat_rate: 0.18, sla_days: 14, warn_days_1: 6, warn_days_2: 3, factory_days: 5, office_days: 3 };
     this.hol = [['2026-09-12', 'ראש השנה א׳'], ['2026-09-13', 'ראש השנה ב׳'], ['2026-09-21', 'יום כיפור'], ['2026-09-26', 'סוכות'], ['2026-10-03', 'שמיני עצרת / שמחת תורה'],
       ['2027-04-22', 'פסח'], ['2027-04-28', 'שביעי של פסח'], ['2027-05-12', 'יום העצמאות'], ['2027-06-11', 'שבועות']].map(([day, name]) => ({ day, name }));
     this.seq = 2778;
@@ -186,12 +186,13 @@ class Demo {
   async createOrder(d) {
     const row = { id: uid(), is_import: false, status: 'to_factory', cost_lior: 0, cost_diamonds: 0, sale_price: 0, payment1_invoice: false, payment2_invoice: false,
       stones_inserted: false, stones_not_needed: false, check_jewelry: false, check_sizes: false, check_gold_color: false, pickup_coordinated: false,
-      factory_started_at: null, factory_days_carry: 0,
+      factory_started_at: null, factory_days_carry: 0, office_started_at: null, office_days_carry: 0,
       entered_at: todayISO(), description: '', created_at: new Date().toISOString(), ...d };
     const err = guardRow(row, null); if (err) throw new Error(err);
     if (row.order_number == null) row.order_number = this.seq++;
     if (this.orders.some(o => o.order_number === row.order_number)) throw new Error('מספר ההזמנה הזה כבר קיים.');
     row.created_by_name = row.updated_by_name; row.status_changed_at = row.created_at; row.updated_at = row.created_at;
+    if (row.status === 'to_factory') row.office_started_at = row.created_at;
     this.orders.push(row); this.log(row, 'created', { to_status: row.status, details: { payment1_amount: row.payment1_amount, payment1_method: row.payment1_method } });
     return this.clone(row);
   }
@@ -203,6 +204,7 @@ class Demo {
     if (row.order_number !== prev.order_number && this.orders.some(o => o.order_number === row.order_number)) throw new Error('מספר ההזמנה הזה כבר קיים.');
     if (row.status !== prev.status) row.status_changed_at = row.updated_at;
     if (row.status === 'factory' && prev.status !== 'factory' && row.factory_started_at === prev.factory_started_at) row.factory_started_at = row.updated_at;
+    if (row.status === 'to_factory' && prev.status !== 'to_factory' && row.office_started_at === prev.office_started_at) row.office_started_at = row.updated_at;
     row.delivered_at = row.status === 'with_customer' ? (prev.status === 'with_customer' ? prev.delivered_at : row.updated_at) : null;
     if (num(row.payment2_amount) == null) row.payment2_at = null; else if (num(prev.payment2_amount) == null) row.payment2_at = row.updated_at;
     this.orders[i] = row;
