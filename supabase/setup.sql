@@ -11,6 +11,7 @@ create table if not exists public.settings (
   sla_days     int not null default 14 check (sla_days > 0),
   warn_days_1  int not null default 6 check (warn_days_1 >= 0),
   warn_days_2  int not null default 3 check (warn_days_2 >= 0),
+  factory_days int not null default 5 check (factory_days > 0),
   updated_at   timestamptz not null default now()
 );
 insert into public.settings (id) values (1) on conflict (id) do nothing;
@@ -55,6 +56,18 @@ create table if not exists public.orders (
   payment2_invoice  boolean not null default false,
   payment2_at       timestamptz,
 
+  -- בדיקות שלב (מסך "דורש טיפול")
+  stones_inserted     boolean not null default false,  -- הכנסת אבנים
+  stones_not_needed   boolean not null default false,  -- אין צורך בהכנסת אבנים
+  check_jewelry       boolean not null default false,  -- בדיקת התכשיט
+  check_sizes         boolean not null default false,  -- מידות
+  check_gold_color    boolean not null default false,  -- צבע זהב
+  pickup_coordinated  boolean not null default false,  -- תיאום איסוף/משלוח
+
+  -- זמן במפעל
+  factory_started_at  timestamptz,                     -- תחילת השהות הנוכחית במפעל
+  factory_days_carry  int not null default 0 check (factory_days_carry >= 0),  -- ימים שנצברו בשהויות קודמות
+
   legacy_payment_note text,
   is_import         boolean not null default false,
   archived_at       timestamptz,
@@ -65,6 +78,18 @@ create table if not exists public.orders (
   updated_by_name   text
 );
 alter table public.orders alter column order_number drop default;
+
+-- עמודות שנוספו אחרי ההקמה הראשונה (בטוח להרצה חוזרת)
+alter table public.settings add column if not exists factory_days int not null default 5 check (factory_days > 0);
+alter table public.orders
+  add column if not exists stones_inserted    boolean not null default false,
+  add column if not exists stones_not_needed  boolean not null default false,
+  add column if not exists check_jewelry      boolean not null default false,
+  add column if not exists check_sizes        boolean not null default false,
+  add column if not exists check_gold_color   boolean not null default false,
+  add column if not exists pickup_coordinated boolean not null default false,
+  add column if not exists factory_started_at timestamptz,
+  add column if not exists factory_days_carry int not null default 0 check (factory_days_carry >= 0);
 alter sequence public.order_number_seq owned by public.orders.order_number;
 
 create index if not exists orders_status_idx  on public.orders (status) where deleted_at is null;
@@ -92,11 +117,19 @@ returns trigger
 language plpgsql
 set search_path = public
 as $$
+declare
+  steps    text[] := array['new','to_factory','factory','returned','ready','with_customer'];
+  new_step int;
+  old_step int := 0;
 begin
+  new_step := coalesce(array_position(steps, new.status), 0);
   if tg_op = 'INSERT' then
     if not new.is_import then
       if new.payment1_amount is null then
         raise exception 'יש להזין כמה שולם בפתיחת ההזמנה (אפשר להזין 0).';
+      end if;
+      if not new.payment1_invoice then
+        raise exception 'לא ניתן לפתוח הזמנה לפני שיצאה חשבונית. יש לסמן "יצאה חשבונית".';
       end if;
       if new.status is null then
         new.status := 'new';
@@ -119,6 +152,38 @@ begin
 
   if new.payment1_amount > 0 and new.payment1_method is null then
     raise exception 'יש לבחור איך שולמה המקדמה.';
+  end if;
+
+  if new.stones_inserted and new.stones_not_needed then
+    raise exception 'יש לבחור רק אחד: "הכנסת אבנים" או "אין צורך בהכנסת אבנים".';
+  end if;
+
+  -- בדיקות שלב: נאכפות רק בהתקדמות קדימה (חזרה אחורה תמיד מותרת).
+  -- הזמנה שעדיין לא שויך לה סטטוס (ייבוא מהאקסל) פטורה בשיוך הראשון.
+  if tg_op = 'UPDATE' and old.status is not null then
+    old_step := coalesce(array_position(steps, old.status), 0);
+    if new_step > old_step then
+      if new_step >= 3 and old_step < 3 and not (new.stones_inserted or new.stones_not_needed) then
+        raise exception 'לפני מעבר למפעל יש לסמן "הכנסת אבנים" או "אין צורך בהכנסת אבנים".';
+      end if;
+      if new_step >= 5 and old_step < 5 then
+        if not (new.check_jewelry and new.check_sizes and new.check_gold_color) then
+          raise exception 'לפני מעבר ל"מוכן למסירה" יש לסמן "בדיקת התכשיט", "מידות" ו"צבע זהב".';
+        end if;
+        if new.payment2_amount is not null and not new.payment2_invoice then
+          raise exception 'לפני מעבר ל"מוכן למסירה" יש לסמן שיצאה חשבונית על השלמת התשלום.';
+        end if;
+      end if;
+      if new_step >= 6 and old_step < 6 and not new.pickup_coordinated then
+        raise exception 'לפני מסירה ללקוח יש לסמן "תיאום איסוף/משלוח".';
+      end if;
+    end if;
+  end if;
+
+  -- כניסה למפעל: אם לא נקבע אחרת, הספירה מתחילה עכשיו
+  if new.status = 'factory' and (tg_op = 'INSERT' or old.status is distinct from 'factory')
+     and (tg_op = 'INSERT' or new.factory_started_at is not distinct from old.factory_started_at) then
+    new.factory_started_at := now();
   end if;
 
   -- מעבר ל"מוכן למסירה" / "אצל הלקוח" מחייב פרטי השלמת תשלום
@@ -174,6 +239,7 @@ as $$
 declare
   actor   text := coalesce(new.updated_by_name, new.created_by_name);
   changed text[] := '{}';
+  ck      jsonb := '{}'::jsonb;
 begin
   if tg_op = 'INSERT' then
     insert into order_events (order_id, actor_name, type, to_status, details)
@@ -220,6 +286,16 @@ begin
         new.payment2_amount  is distinct from old.payment2_amount
      or new.payment2_method  is distinct from old.payment2_method
      or new.payment2_invoice is distinct from old.payment2_invoice) then changed := changed || 'payment2'::text; end if;
+
+  if new.stones_inserted    is distinct from old.stones_inserted    then ck := ck || jsonb_build_object('stones_inserted', new.stones_inserted); end if;
+  if new.stones_not_needed  is distinct from old.stones_not_needed  then ck := ck || jsonb_build_object('stones_not_needed', new.stones_not_needed); end if;
+  if new.check_jewelry      is distinct from old.check_jewelry      then ck := ck || jsonb_build_object('check_jewelry', new.check_jewelry); end if;
+  if new.check_sizes        is distinct from old.check_sizes        then ck := ck || jsonb_build_object('check_sizes', new.check_sizes); end if;
+  if new.check_gold_color   is distinct from old.check_gold_color   then ck := ck || jsonb_build_object('check_gold_color', new.check_gold_color); end if;
+  if new.pickup_coordinated is distinct from old.pickup_coordinated then ck := ck || jsonb_build_object('pickup_coordinated', new.pickup_coordinated); end if;
+  if ck <> '{}'::jsonb then
+    insert into order_events (order_id, actor_name, type, details) values (new.id, actor, 'checklist', ck);
+  end if;
 
   if array_length(changed, 1) > 0 then
     insert into order_events (order_id, actor_name, type, details)

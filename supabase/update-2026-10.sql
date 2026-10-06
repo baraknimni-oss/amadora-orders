@@ -1,83 +1,9 @@
 -- =====================================================================
--- AMADORA · מערכת ניהול הזמנות · מבנה בסיס הנתונים
+-- AMADORA · עדכון אוקטובר 2026: בדיקות שלב, חשבונית חובה, ימים במפעל
 -- להרצה פעם אחת ב-Supabase: SQL Editor -> New query -> הדבקה -> Run
--- בטוח להרצה חוזרת (לא מוחק נתונים קיימים).
+-- בטוח להרצה חוזרת. לא מוחק ולא משנה נתונים קיימים (מלבד מילוי תאריך כניסה למפעל
+-- להזמנות שנמצאות כרגע במפעל).
 -- =====================================================================
-
--- ---------- הגדרות כלליות (שורה אחת) ----------
-create table if not exists public.settings (
-  id           int primary key default 1 check (id = 1),
-  vat_rate     numeric(5,4) not null default 0.18 check (vat_rate >= 0 and vat_rate < 1),
-  sla_days     int not null default 14 check (sla_days > 0),
-  warn_days_1  int not null default 6 check (warn_days_1 >= 0),
-  warn_days_2  int not null default 3 check (warn_days_2 >= 0),
-  factory_days int not null default 5 check (factory_days > 0),
-  updated_at   timestamptz not null default now()
-);
-insert into public.settings (id) values (1) on conflict (id) do nothing;
-
--- ---------- חגים (ימים שאינם ימי עסקים, בנוסף לשישי ושבת) ----------
-create table if not exists public.holidays (
-  day  date primary key,
-  name text not null
-);
-
--- ---------- הזמנות ----------
-create sequence if not exists public.order_number_seq start with 2772;
-
-create table if not exists public.orders (
-  id                uuid primary key default gen_random_uuid(),
-  order_number      int  not null unique,  -- מוקצה אוטומטית רק אחרי שכל הבדיקות עברו
-  customer_name     text not null check (length(btrim(customer_name)) > 0),
-  customer_phone    text,
-  entered_at        date not null default ((now() at time zone 'Asia/Jerusalem')::date),
-  description       text not null default '',
-  source            text,
-  notes             text,
-
-  -- סטטוס הזמנה. NULL = ממתין לשיוך (הזמנות שיובאו מהאקסל)
-  status            text check (status in ('new','to_factory','factory','returned','ready','with_customer')),
-  status_changed_at timestamptz,
-  delivered_at      timestamptz,
-
-  -- הרכב עלויות ומחיר
-  cost_lior         numeric(12,2) not null default 0 check (cost_lior >= 0),
-  cost_diamonds     numeric(12,2) not null default 0 check (cost_diamonds >= 0),
-  sale_price        numeric(12,2) not null default 0 check (sale_price >= 0),
-
-  -- תשלום ראשון (מקדמה) - חובה בפתיחת הזמנה
-  payment1_amount   numeric(12,2) check (payment1_amount >= 0),
-  payment1_method   text check (payment1_method in ('מזומן','העברה בנקאית','אשראי','שת"פ','פייבוקס','ביט','אתר')),
-  payment1_invoice  boolean not null default false,
-
-  -- תשלום שני (השלמה) - חובה לפני "מוכן למסירה"
-  payment2_amount   numeric(12,2) check (payment2_amount >= 0),
-  payment2_method   text check (payment2_method in ('מזומן','העברה בנקאית','אשראי','שת"פ','פייבוקס','ביט','אתר')),
-  payment2_invoice  boolean not null default false,
-  payment2_at       timestamptz,
-
-  -- בדיקות שלב (מסך "דורש טיפול")
-  stones_inserted     boolean not null default false,  -- הכנסת אבנים
-  stones_not_needed   boolean not null default false,  -- אין צורך בהכנסת אבנים
-  check_jewelry       boolean not null default false,  -- בדיקת התכשיט
-  check_sizes         boolean not null default false,  -- מידות
-  check_gold_color    boolean not null default false,  -- צבע זהב
-  pickup_coordinated  boolean not null default false,  -- תיאום איסוף/משלוח
-
-  -- זמן במפעל
-  factory_started_at  timestamptz,                     -- תחילת השהות הנוכחית במפעל
-  factory_days_carry  int not null default 0 check (factory_days_carry >= 0),  -- ימים שנצברו בשהויות קודמות
-
-  legacy_payment_note text,
-  is_import         boolean not null default false,
-  archived_at       timestamptz,
-  deleted_at        timestamptz,
-  created_at        timestamptz not null default now(),
-  updated_at        timestamptz not null default now(),
-  created_by_name   text,
-  updated_by_name   text
-);
-alter table public.orders alter column order_number drop default;
 
 -- עמודות שנוספו אחרי ההקמה הראשונה (בטוח להרצה חוזרת)
 alter table public.settings add column if not exists factory_days int not null default 5 check (factory_days > 0);
@@ -90,28 +16,8 @@ alter table public.orders
   add column if not exists pickup_coordinated boolean not null default false,
   add column if not exists factory_started_at timestamptz,
   add column if not exists factory_days_carry int not null default 0 check (factory_days_carry >= 0);
-alter sequence public.order_number_seq owned by public.orders.order_number;
 
-create index if not exists orders_status_idx  on public.orders (status) where deleted_at is null;
-create index if not exists orders_entered_idx on public.orders (entered_at);
-
--- ---------- היסטוריית שינויים ----------
-create table if not exists public.order_events (
-  id          bigint generated always as identity primary key,
-  order_id    uuid not null references public.orders(id) on delete cascade,
-  at          timestamptz not null default now(),
-  actor_name  text,
-  type        text not null,
-  from_status text,
-  to_status   text,
-  details     jsonb
-);
-create index if not exists order_events_order_idx on public.order_events (order_id, at);
-create index if not exists order_events_type_idx  on public.order_events (type, at);
-
--- =====================================================================
--- כללי עבודה (נאכפים בבסיס הנתונים, גם לחיבורים חיצוניים)
--- =====================================================================
+-- ---------- כללי העבודה המעודכנים ----------
 create or replace function public.orders_guard()
 returns trigger
 language plpgsql
@@ -224,12 +130,7 @@ begin
 end;
 $$;
 
-drop trigger if exists orders_guard on public.orders;
-create trigger orders_guard
-  before insert or update on public.orders
-  for each row execute function public.orders_guard();
-
--- ---------- רישום היסטוריה אוטומטי ----------
+-- ---------- רישום היסטוריה (כולל סימוני בדיקות) ----------
 create or replace function public.orders_log()
 returns trigger
 language plpgsql
@@ -305,45 +206,11 @@ begin
 end;
 $$;
 
-drop trigger if exists orders_log on public.orders;
-create trigger orders_log
-  after insert or update on public.orders
-  for each row execute function public.orders_log();
-
--- =====================================================================
--- הרשאות: רק משתמשים מחוברים. אין גישה לאורחים.
--- =====================================================================
-alter table public.orders       enable row level security;
-alter table public.order_events enable row level security;
-alter table public.settings     enable row level security;
-alter table public.holidays     enable row level security;
-
-revoke all on public.orders, public.order_events, public.settings, public.holidays from anon;
-grant select, insert, update, delete on public.orders   to authenticated;
-grant select                         on public.order_events to authenticated;
-grant select, update                 on public.settings to authenticated;
-grant select, insert, update, delete on public.holidays to authenticated;
-grant usage, select on sequence public.order_number_seq to authenticated;
-grant all on public.orders, public.order_events, public.settings, public.holidays to service_role;
-grant usage, select on sequence public.order_number_seq to service_role;
-
-drop policy if exists orders_select on public.orders;
-drop policy if exists orders_insert on public.orders;
-drop policy if exists orders_update on public.orders;
-drop policy if exists orders_delete on public.orders;
-create policy orders_select on public.orders for select to authenticated using (true);
-create policy orders_insert on public.orders for insert to authenticated with check (true);
-create policy orders_update on public.orders for update to authenticated using (true) with check (true);
--- מחיקה לצמיתות אפשרית רק להזמנה שכבר נמצאת בסל המחזור
-create policy orders_delete on public.orders for delete to authenticated using (deleted_at is not null);
-
-drop policy if exists events_select on public.order_events;
-create policy events_select on public.order_events for select to authenticated using (true);
-
-drop policy if exists settings_select on public.settings;
-drop policy if exists settings_update on public.settings;
-create policy settings_select on public.settings for select to authenticated using (true);
-create policy settings_update on public.settings for update to authenticated using (true) with check (true);
-
-drop policy if exists holidays_all on public.holidays;
-create policy holidays_all on public.holidays for all to authenticated using (true) with check (true);
+-- ---------- הזמנות שכבר נמצאות במפעל: מאיזה יום לספור ----------
+-- לפי מועד הכניסה האחרון לסטטוס "מפעל" מתוך ההיסטוריה, ואם אין - מועד שינוי הסטטוס האחרון.
+update public.orders o
+set factory_started_at = coalesce(
+  (select max(e.at) from public.order_events e
+    where e.order_id = o.id and e.type in ('status', 'created') and e.to_status = 'factory'),
+  o.status_changed_at, now())
+where o.status = 'factory' and o.factory_started_at is null;
