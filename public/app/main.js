@@ -3,14 +3,14 @@ import { h, icon, toast, modal, field, moneyInput, methodChips, readRadio, searc
 import {
   STATUSES, statusLabel, statusKey, todayISO, sla, urgency, collection, money, money0,
   suggestedRemainder, validatePayment2, num, fmtDate, CHECKLISTS, transitionBlock, needsPaymentForm,
-  factoryTime, factoryStayDays, crossesReady,
+  stageTime, clockPatch, needsClockChoice, STAGE_CLOCKS, crossesReady,
 } from './logic.js';
 import * as V from './views.js';
 
 const root = document.getElementById('root');
 const ctx = {
   api: null, cfg: null, name: store.get('amadora.name') || '',
-  orders: [], settings: { vat_rate: 0.18, sla_days: 14, warn_days_1: 6, warn_days_2: 3, factory_days: 5 },
+  orders: [], settings: { vat_rate: 0.18, sla_days: 14, warn_days_1: 6, warn_days_2: 3, factory_days: 5, office_days: 3 },
   holidays: new Set(), holidayList: [], today: todayISO(), loadedAt: null, stale: false,
 };
 
@@ -19,7 +19,7 @@ ctx.go = hash => { if (location.hash === hash) render(); else location.hash = ha
 ctx.active = () => ctx.orders.filter(o => !o.deleted_at && !o.archived_at);
 ctx.byNumber = n => ctx.orders.find(o => String(o.order_number) === String(n));
 ctx.slaOf = o => sla(o, ctx.settings, ctx.holidays, ctx.today);
-ctx.factoryOf = o => factoryTime(o, ctx.settings, ctx.holidays, ctx.today);
+ctx.stageOf = o => stageTime(o, ctx.settings, ctx.holidays, ctx.today);
 /** Orders shown on the "דורש טיפול" board. */
 ctx.WORK_KEYS = ['to_factory', 'returned', 'ready'];
 ctx.workQueue = () => ctx.active().filter(o => ctx.WORK_KEYS.includes(o.status));
@@ -48,51 +48,113 @@ ctx.save = async (id, patch, okMsg) => {
   } catch (e) { handleError(e); throw e; }
 };
 
-/** Move an order to another status. Enforces the stage checklists, asks about the factory clock when needed,
- *  and opens the payment form first when the move requires it. */
+/** Move an order to another status. Enforces the stage checklists, asks about the stage clock (office / factory)
+ *  when the order returns to a stage it was in before, and opens the payment form first when the move requires it. */
 ctx.changeStatus = async (o, to) => {
   if (statusKey(o) === to) return false;
   const block = transitionBlock(o, to);
   if (block) { toast(block, true); return false; }
-  const extra = {};
-  if (o.status === 'factory' && to !== 'factory') {
-    extra.factory_days_carry = (+o.factory_days_carry || 0) + factoryStayDays(o, ctx.holidays, ctx.today);
+  let choice = 'restart';
+  if (needsClockChoice(o, to)) {
+    choice = await askClock(to, [o]);
+    if (!choice) return false;
   }
-  if (to === 'factory' && o.status !== 'factory') {
-    let carry = 0;
-    if (o.factory_started_at) { // was at the factory before
-      const choice = await askFactoryClock(o);
-      if (!choice) return false;
-      carry = choice === 'continue' ? (+o.factory_days_carry || 0) : 0;
-    }
-    extra.factory_started_at = new Date().toISOString();
-    extra.factory_days_carry = carry;
-  }
+  const extra = clockPatch(o, to, choice, ctx.holidays, ctx.today);
   if (needsPaymentForm(o, to)) return ctx.openPayment2(o, to, extra);
   const ok = await ctx.save(o.id, { status: to, ...extra }, `#${o.order_number} הועברה ל"${statusLabel(to)}"`).then(() => true, () => false);
   render();
   return ok;
 };
 
-/** Returning to the factory: continue the previous count or start over. Resolves 'continue' | 'restart' | null. */
-function askFactoryClock(o) {
+/** Returning to the office / factory: continue the previous count or start over. Resolves 'continue' | 'restart' | null. */
+function askClock(to, list) {
+  const c = STAGE_CLOCKS[to];
   return new Promise(resolve => {
-    const prev = +o.factory_days_carry || 0;
     let choice = null;
+    const one = list.length === 1 ? list[0] : null;
+    const prev = one ? (+one[c.carry] || 0) : null;
+    const text = one
+      ? `הזמנה #${one.order_number} כבר הייתה ${c.where} ${prev} ${prev === 1 ? 'יום עסקים' : 'ימי עסקים'}.`
+      : `${list.length} מההזמנות שנבחרו כבר היו ${c.where} בעבר (${list.map(o => `#${o.order_number}`).join(', ')}).`;
     const m = modal({
-      title: 'חזרה למפעל',
+      title: c.back,
       body: h('div', { style: { display: 'flex', 'flex-direction': 'column', gap: '10px', 'line-height': '1.7' } },
-        h('p', { style: { margin: 0 } }, `הזמנה #${o.order_number} כבר הייתה במפעל ${prev} ${prev === 1 ? 'יום עסקים' : 'ימי עסקים'}.`),
-        h('p', { style: { margin: 0, color: 'var(--muted)' } }, 'להמשיך את הספירה מאותה נקודה, או להתחיל לספור מחדש מהיום?')),
+        h('p', { style: { margin: 0 } }, text),
+        h('p', { style: { margin: 0, color: 'var(--muted)' } }, one
+          ? 'להמשיך את הספירה מאותה נקודה, או להתחיל לספור מחדש מהיום?'
+          : 'להמשיך לכל אחת מהן את הספירה מאיפה שעצרה, או להתחיל לכולן ספירה מחדש מהיום?')),
       onClose: () => resolve(choice),
       actions: [
-        h('button', { class: 'btn btn-primary', type: 'button', onclick: () => { choice = 'continue'; m.close(); } }, `להמשיך מ-${prev} ימים`),
+        h('button', { class: 'btn btn-primary', type: 'button', onclick: () => { choice = 'continue'; m.close(); } }, one ? `להמשיך מ-${prev} ימים` : 'להמשיך את הספירה'),
         h('button', { class: 'btn btn-ghost', type: 'button', onclick: () => { choice = 'restart'; m.close(); } }, 'להתחיל ספירה מחדש'),
         h('button', { class: 'btn btn-ghost', type: 'button', onclick: () => m.close() }, 'ביטול'),
       ],
     });
   });
 }
+
+// ---------------------------------------------------------------- bulk actions (כל ההזמנות)
+async function runBulk(list, makePatch) {
+  let done = 0; const failed = [];
+  for (const o of list) {
+    try {
+      const row = await ctx.api.updateOrder(o.id, { ...makePatch(o), updated_by_name: ctx.name });
+      const i = ctx.orders.findIndex(x => x.id === o.id); if (i >= 0) ctx.orders[i] = row;
+      done++;
+    } catch (e) {
+      if (e instanceof AuthError) { handleError(e); break; }
+      failed.push({ o, why: e?.message || 'שגיאה' });
+    }
+  }
+  return { done, failed };
+}
+function bulkReport(title, done, skipped) {
+  if (!skipped.length) return;
+  const m = modal({
+    title,
+    body: h('div', { style: { display: 'flex', 'flex-direction': 'column', gap: '10px', 'line-height': '1.6' } },
+      done ? h('p', { style: { margin: 0 } }, `${done} הזמנות עודכנו.`) : null,
+      h('p', { style: { margin: 0, 'font-weight': '600' } }, `${skipped.length} הזמנות לא עודכנו:`),
+      h('div', { class: 'rowlist' }, skipped.map(({ o, why }) => h('a', { href: `#/order/${o.order_number}`, onclick: () => m.close() },
+        h('div', { class: 'r-main' }, h('div', { class: 'r-title' }, `#${o.order_number} · ${o.customer_name}`), h('div', { class: 'r-sub', style: { 'white-space': 'normal' } }, why)))))),
+    actions: [h('button', { class: 'btn btn-primary', type: 'button', onclick: () => m.close() }, 'סגירה')],
+  });
+}
+
+/** Move many orders at once. Orders that need a checklist or the payment form are skipped and reported. */
+ctx.bulkStatus = async (list, to) => {
+  const skipped = [], go = [];
+  for (const o of list) {
+    if (statusKey(o) === to) continue;
+    const block = transitionBlock(o, to);
+    if (block) skipped.push({ o, why: block });
+    else if (needsPaymentForm(o, to)) skipped.push({ o, why: 'נדרשת השלמת תשלום וחשבונית: יש להעביר את ההזמנה הזו בנפרד מתוך דף ההזמנה.' });
+    else go.push(o);
+  }
+  let choice = 'restart';
+  const returning = go.filter(o => needsClockChoice(o, to));
+  if (returning.length) { choice = await askClock(to, returning); if (!choice) return false; }
+  const { done, failed } = await runBulk(go, o => ({ status: to, ...clockPatch(o, to, choice, ctx.holidays, ctx.today) }));
+  if (done) toast(`${done} הזמנות הועברו ל"${statusLabel(to)}"`);
+  bulkReport('העברת סטטוס', done, [...skipped, ...failed]);
+  if (!done && !skipped.length && !failed.length) toast('כל ההזמנות שנבחרו כבר נמצאות בסטטוס הזה.');
+  render();
+  return true;
+};
+ctx.bulkArchive = async list => {
+  const { done, failed } = await runBulk(list.filter(o => !o.archived_at), () => ({ archived_at: new Date().toISOString() }));
+  if (done) toast(`${done} הזמנות הועברו לארכיון`);
+  bulkReport('העברה לארכיון', done, failed);
+  render();
+};
+ctx.bulkTrash = async list => {
+  if (!await confirmBox({ title: 'מחיקת הזמנות', text: `${list.length} הזמנות יעברו לסל המחזור. אפשר לשחזר אותן משם בכל עת.`, okText: 'העבר לסל המחזור', danger: true })) return false;
+  const { done, failed } = await runBulk(list, () => ({ deleted_at: new Date().toISOString() }));
+  if (done) toast(`${done} הזמנות הועברו לסל המחזור`);
+  bulkReport('מחיקת הזמנות', done, failed);
+  render();
+  return true;
+};
 
 /** Tick / untick a stage checklist item. "Exclusive" groups (stones) allow only one ticked item. */
 ctx.toggleCheck = async (o, key, value) => {
