@@ -110,6 +110,16 @@ export function statusList(ctx, key) {
 
 // ===================================================================== ATTENTION (work board with stage checklists)
 /** The checklist block shown inside a card. Clicks here must not open the order page. */
+/** Save a cost (ליאור / יהלומים) typed into a quick field, then redraw. */
+async function saveCost(ctx, o, fieldKey, raw, what) {
+  const v = num(raw);
+  if (v == null || v < 0) return 'יש להזין סכום תקין.';
+  await ctx.save(o.id, { [fieldKey]: v }, `${what} עודכן בהזמנה #${o.order_number}: ${money(v)}`).catch(() => {});
+  if (ctx.costDrafts) delete ctx.costDrafts[`${o.id}:${fieldKey}`];
+  ctx.render();
+  return null;
+}
+
 /** Optional cost helper inside a card: a price field + "הכנס" that writes straight into the order's cost field.
  *  Never required for moving on. */
 function costField(ctx, o, { field: fieldKey, label, what }) {
@@ -121,11 +131,8 @@ function costField(ctx, o, { field: fieldKey, label, what }) {
   input.addEventListener('focus', () => { const c = card(); if (c) c.draggable = false; });
   input.addEventListener('blur', () => { const c = card(); if (c) c.draggable = true; });
   const insert = async () => {
-    const v = num(input.value);
-    if (v == null || v < 0) { err.textContent = 'יש להזין סכום תקין.'; err.hidden = false; return; }
-    err.hidden = true;
-    await ctx.save(o.id, { [fieldKey]: v }, `${what} עודכן בהזמנה #${o.order_number}: ${money(v)}`).catch(() => {});
-    ctx.render();
+    const bad = await saveCost(ctx, o, fieldKey, input.value, what);
+    err.textContent = bad || ''; err.hidden = !bad;
   };
   input.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); insert(); } });
   const f = financials(o, ctx.settings.vat_rate);
@@ -167,6 +174,58 @@ function checklistBox(ctx, o, key) {
   !done ? h('div', { class: 'hint-locked' }, c.mode === 'any' ? 'יש לסמן אחת מהאפשרויות כדי להתקדם' : 'יש לסמן את כל הבדיקות כדי להתקדם') : null);
 }
 
+// ---------- הנהלת חשבונות: orders still missing a raw cost ----------
+/** Which costs are still missing. Diamonds are not expected when "אין צורך בהכנסת אבנים" is ticked. */
+const missingCosts = o => ({ lior: !(+o.cost_lior > 0), diam: !(+o.cost_diamonds > 0) && !o.stones_not_needed });
+
+function accountingSection(ctx) {
+  const st = ctx.acctState ||= { all: false };
+  ctx.costDrafts ||= {};
+  const list = ctx.orders.filter(o => !o.deleted_at).filter(o => { const m = missingCosts(o); return m.lior || m.diam; })
+    .sort((a, b) => b.order_number - a.order_number);
+  const LIMIT = 25;
+  const shown = st.all ? list : list.slice(0, LIMIT);
+
+  const cell = (o, fieldKey, what, missing) => {
+    const k = `${o.id}:${fieldKey}`;
+    const saved = +o[fieldKey] || 0;
+    const input = h('input', { type: 'number', inputmode: 'decimal', min: '0', step: '0.01', placeholder: missing ? 'חסר' : '0', 'aria-label': `${what} להזמנה ${o.order_number}`,
+      value: ctx.costDrafts[k] ?? (saved || ''), oninput: e => { ctx.costDrafts[k] = e.target.value; } });
+    const err = h('div', { class: 'oc-cost-err', hidden: true });
+    const insert = async () => { const bad = await saveCost(ctx, o, fieldKey, input.value, what); err.textContent = bad || ''; err.hidden = !bad; };
+    input.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); insert(); } });
+    // ".field" keeps the 30-second auto refresh from redrawing while typing
+    return h('td', { class: `acct-cell${missing ? ' missing' : ''}` }, h('div', { class: 'field' },
+      h('div', { class: 'oc-cost-row' }, h('div', { class: 'money-in' }, input), h('button', { class: 'btn btn-ghost btn-sm', type: 'button', onclick: insert }, 'הכנס')),
+      err));
+  };
+
+  const body = list.length ? h('div', { class: 'table-wrap' }, h('table', { class: 't acct' },
+    h('thead', null, h('tr', null, h('th', null, '#'), h('th', null, 'לקוח'), h('th', { class: 'hide-sm' }, 'סטטוס'), h('th', { class: 'num' }, 'מחיר מכירה'),
+      h('th', null, 'ליאור (מחיר מפעל)'), h('th', null, 'יהלומים'), h('th', { class: 'num' }, 'רווח'))),
+    h('tbody', null, shown.map(o => {
+      const m = missingCosts(o), f = financials(o, ctx.settings.vat_rate);
+      return h('tr', null,
+        h('td', { class: 'tnum' }, h('a', { href: `#/order/${o.order_number}`, class: 'btn-link' }, o.order_number)),
+        h('td', null, h('b', null, o.customer_name), o.archived_at ? h('span', { class: 'pill muted', style: { 'margin-inline-start': '6px' } }, 'ארכיון') : null),
+        h('td', { class: 'hide-sm' }, statusPill(o)),
+        h('td', { class: 'num' }, +o.sale_price ? money0(o.sale_price) : '—'),
+        cell(o, 'cost_lior', 'מחיר המפעל (ליאור)', m.lior),
+        o.stones_not_needed ? h('td', { class: 'acct-na' }, 'אין צורך באבנים') : cell(o, 'cost_diamonds', 'מחיר היהלומים', m.diam),
+        h('td', { class: 'num' }, +o.sale_price ? money0(f.profit) : '—'));
+    })))) : h('div', { class: 'empty' }, 'לכל ההזמנות הוזנו עלויות ליאור ויהלומים.');
+
+  return h('section', { class: 'acct-sec' },
+    h('div', { class: 'card' },
+      h('div', { class: 'card-h' }, h('h2', null, 'הנהלת חשבונות'),
+        h('span', { class: 'aside' }, list.length ? `${plural(list.length, 'הזמנה', 'הזמנות')} עם עלות חסרה` : 'הכול מעודכן')),
+      list.length ? h('div', { class: 'card-b', style: { 'padding-bottom': '0', color: 'var(--muted)', 'font-size': '13px' } },
+        'הזינו את העלויות החסרות ולחצו "הכנס" (או Enter). הסכום נשמר מיד בהזמנה, והרווח מתעדכן. הזמנה שכל העלויות שלה הוזנו יורדת מהרשימה.') : null,
+      body,
+      list.length > LIMIT ? h('div', { class: 'card-f' }, h('button', { class: 'btn-link', type: 'button', onclick: () => { st.all = !st.all; ctx.render(); } },
+        st.all ? 'הצג פחות' : `הצג את כל ${list.length} ההזמנות`)) : null));
+}
+
 export function attention(ctx) {
   const keys = ctx.WORK_KEYS;
   const act = ctx.active();
@@ -197,6 +256,7 @@ export function attention(ctx) {
     pageHead('דורש טיפול', `סמנו את הבדיקות בכל הזמנה כדי לאפשר מעבר לשלב הבא. כתום: נותרו ${ctx.settings.warn_days_1} ימים או פחות לאספקה · אדום: ${ctx.settings.warn_days_2} ימים או פחות.`,
       [h('a', { class: 'btn btn-ghost', href: '#/board' }, icon('board', 16), 'לוח עבודה מלא')], crumbTo('#/', 'לוח בקרה')),
     h('div', { class: 'board-wrap' }, h('div', { class: 'board' }, cols)),
+    accountingSection(ctx),
     diffs.length ? sec('הפרש בתשלומים', diffs, 'סכום התשלומים שונה ממחיר המכירה') : null,
     unassigned.length ? sec('ממתינות לשיוך סטטוס', unassigned) : null);
 }
@@ -568,7 +628,7 @@ export function newOrder(ctx) {
       h('div', { class: 'grid-3' },
         withErr(field('עלות ליאור', moneyInput('n_lior', 0)), 'cost_lior'),
         withErr(field('עלות יהלומים', moneyInput('n_diam', 0)), 'cost_diamonds'),
-        withErr(field('מחיר מכירה', moneyInput('n_sale', ''), { hint: 'כולל מע"מ' }), 'sale_price'))), { cls: 'form-sec' }),
+        withErr(field('מחיר מכירה', moneyInput('n_sale', ''), { req: true, hint: 'כולל מע"מ' }), 'sale_price'))), { cls: 'form-sec' }),
     card('תשלום בפתיחת ההזמנה', h('div', { class: 'card-b' },
       h('p', { style: { margin: 0, color: 'var(--muted)', 'font-size': '13px' } }, 'חובה למלא לפני פתיחת ההזמנה. אם לא שולמה מקדמה, הזינו 0. לא ניתן לפתוח הזמנה לפני שיצאה חשבונית.'),
       withErr(field('כמה שולם?', moneyInput('n_p1', ''), { req: true, hint: 'בשקלים' }), 'payment1_amount'),
