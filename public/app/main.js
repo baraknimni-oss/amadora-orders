@@ -1,15 +1,16 @@
 import { loadConfig, makeApi, store, AuthError } from './api.js';
 import { h, icon, toast, modal, field, moneyInput, methodChips, readRadio, searchOrders, confirmBox } from './ui.js';
 import {
-  STATUSES, NEEDS_PAYMENT2, statusLabel, statusKey, todayISO, sla, urgency, collection, money, money0,
-  suggestedRemainder, validatePayment2, num, fmtDate,
+  STATUSES, statusLabel, statusKey, todayISO, sla, urgency, collection, money, money0,
+  suggestedRemainder, validatePayment2, num, fmtDate, CHECKLISTS, transitionBlock, needsPaymentForm,
+  factoryTime, factoryStayDays, stepOf,
 } from './logic.js';
 import * as V from './views.js';
 
 const root = document.getElementById('root');
 const ctx = {
   api: null, cfg: null, name: store.get('amadora.name') || '',
-  orders: [], settings: { vat_rate: 0.18, sla_days: 14, warn_days_1: 6, warn_days_2: 3 },
+  orders: [], settings: { vat_rate: 0.18, sla_days: 14, warn_days_1: 6, warn_days_2: 3, factory_days: 5 },
   holidays: new Set(), holidayList: [], today: todayISO(), loadedAt: null, stale: false,
 };
 
@@ -18,6 +19,10 @@ ctx.go = hash => { if (location.hash === hash) render(); else location.hash = ha
 ctx.active = () => ctx.orders.filter(o => !o.deleted_at && !o.archived_at);
 ctx.byNumber = n => ctx.orders.find(o => String(o.order_number) === String(n));
 ctx.slaOf = o => sla(o, ctx.settings, ctx.holidays, ctx.today);
+ctx.factoryOf = o => factoryTime(o, ctx.settings, ctx.holidays, ctx.today);
+/** Orders shown on the "דורש טיפול" board. */
+ctx.WORK_KEYS = ['to_factory', 'returned', 'ready'];
+ctx.workQueue = () => ctx.active().filter(o => ctx.WORK_KEYS.includes(o.status));
 ctx.attention = () => ctx.active()
   .map(o => ({ o, s: ctx.slaOf(o) }))
   .filter(({ s }) => s && !s.stopped && ['warn', 'critical', 'late'].includes(s.level))
@@ -43,21 +48,69 @@ ctx.save = async (id, patch, okMsg) => {
   } catch (e) { handleError(e); throw e; }
 };
 
-/** Move an order to another status. Opens the payment form first when the move requires it. */
+/** Move an order to another status. Enforces the stage checklists, asks about the factory clock when needed,
+ *  and opens the payment form first when the move requires it. */
 ctx.changeStatus = async (o, to) => {
-  if (statusKey(o) === to) return;
-  if (NEEDS_PAYMENT2.has(to) && num(o.payment2_amount) == null) return ctx.openPayment2(o, to);
-  await ctx.save(o.id, { status: to }, `#${o.order_number} הועברה ל"${statusLabel(to)}"`).catch(() => {});
+  if (statusKey(o) === to) return false;
+  const block = transitionBlock(o, to);
+  if (block) { toast(block, true); return false; }
+  const extra = {};
+  if (o.status === 'factory' && to !== 'factory') {
+    extra.factory_days_carry = (+o.factory_days_carry || 0) + factoryStayDays(o, ctx.holidays, ctx.today);
+  }
+  if (to === 'factory' && o.status !== 'factory') {
+    let carry = 0;
+    if (o.factory_started_at) { // was at the factory before
+      const choice = await askFactoryClock(o);
+      if (!choice) return false;
+      carry = choice === 'continue' ? (+o.factory_days_carry || 0) : 0;
+    }
+    extra.factory_started_at = new Date().toISOString();
+    extra.factory_days_carry = carry;
+  }
+  if (needsPaymentForm(o, to)) return ctx.openPayment2(o, to, extra);
+  const ok = await ctx.save(o.id, { status: to, ...extra }, `#${o.order_number} הועברה ל"${statusLabel(to)}"`).then(() => true, () => false);
+  render();
+  return ok;
+};
+
+/** Returning to the factory: continue the previous count or start over. Resolves 'continue' | 'restart' | null. */
+function askFactoryClock(o) {
+  return new Promise(resolve => {
+    const prev = +o.factory_days_carry || 0;
+    let choice = null;
+    const m = modal({
+      title: 'חזרה למפעל',
+      body: h('div', { style: { display: 'flex', 'flex-direction': 'column', gap: '10px', 'line-height': '1.7' } },
+        h('p', { style: { margin: 0 } }, `הזמנה #${o.order_number} כבר הייתה במפעל ${prev} ${prev === 1 ? 'יום עסקים' : 'ימי עסקים'}.`),
+        h('p', { style: { margin: 0, color: 'var(--muted)' } }, 'להמשיך את הספירה מאותה נקודה, או להתחיל לספור מחדש מהיום?')),
+      onClose: () => resolve(choice),
+      actions: [
+        h('button', { class: 'btn btn-primary', type: 'button', onclick: () => { choice = 'continue'; m.close(); } }, `להמשיך מ-${prev} ימים`),
+        h('button', { class: 'btn btn-ghost', type: 'button', onclick: () => { choice = 'restart'; m.close(); } }, 'להתחיל ספירה מחדש'),
+        h('button', { class: 'btn btn-ghost', type: 'button', onclick: () => m.close() }, 'ביטול'),
+      ],
+    });
+  });
+}
+
+/** Tick / untick a stage checklist item. "Exclusive" groups (stones) allow only one ticked item. */
+ctx.toggleCheck = async (o, key, value) => {
+  const patch = { [key]: value };
+  const group = Object.values(CHECKLISTS).find(c => c.items.some(i => i.key === key));
+  if (value && group?.exclusive) for (const i of group.items) if (i.key !== key) patch[i.key] = false;
+  await ctx.save(o.id, patch).catch(() => {});
   render();
 };
 
-ctx.openPayment2 = (o, thenStatus = null) => new Promise(resolve => {
+ctx.openPayment2 = (o, thenStatus = null, extra = {}) => new Promise(resolve => {
   const suggested = suggestedRemainder(o);
+  const requireInvoice = !!thenStatus && !!o.status && stepOf(o.status) < 5 && stepOf(thenStatus) >= 5;
   const errs = h('div');
   const amount = moneyInput('p2_amount', o.payment2_amount ?? '', { placeholder: String(suggested) });
   const body = h('div', { style: { display: 'flex', 'flex-direction': 'column', gap: '14px' } },
     thenStatus ? h('p', { style: { margin: 0, color: 'var(--muted)' } },
-      `כדי להעביר את הזמנה #${o.order_number} ל"${statusLabel(thenStatus)}" צריך להזין את השלמת התשלום.`) : null,
+      `כדי להעביר את הזמנה #${o.order_number} ל"${statusLabel(thenStatus)}" צריך להזין את השלמת התשלום${requireInvoice ? ' ולסמן שיצאה חשבונית' : ''}.`) : null,
     h('div', { class: 'kv', style: { background: 'var(--surface-2)', border: '1px solid var(--line)', 'border-radius': '8px', padding: '2px 14px' } },
       h('div', { class: 'kv-r' }, h('span', { class: 'k' }, 'מחיר מכירה'), h('span', { class: 'v' }, money(o.sale_price))),
       h('div', { class: 'kv-r' }, h('span', { class: 'k' }, 'שולם בפתיחה'), h('span', { class: 'v' }, o.payment1_amount == null ? 'לא הוזן' : money(o.payment1_amount))),
@@ -68,7 +121,8 @@ ctx.openPayment2 = (o, thenStatus = null) => new Promise(resolve => {
       h('button', { class: 'btn btn-ghost btn-sm', type: 'button', onclick: () => { amount.querySelector('input').value = suggested; } }, `השתמש ב-${money0(suggested)}`)),
     { req: true, hint: 'אפשר 0' }),
     field('איך שולם?', methodChips('p2_method', o.payment2_method), { req: true, hint: 'חובה אם הסכום גדול מ-0' }),
-    h('label', { class: 'check' }, h('input', { type: 'checkbox', id: 'p2_invoice', checked: o.payment2_invoice }), 'יצאה חשבונית'),
+    h('label', { class: 'check' }, h('input', { type: 'checkbox', id: 'p2_invoice', checked: o.payment2_invoice }), 'יצאה חשבונית',
+      requireInvoice ? h('span', { class: 'req' }, ' *') : null),
     errs,
   );
   let saved = false;
@@ -82,12 +136,12 @@ ctx.openPayment2 = (o, thenStatus = null) => new Promise(resolve => {
           payment2_method: readRadio(m.box, 'p2_method'),
           payment2_invoice: m.box.querySelector('#p2_invoice').checked,
         };
-        const e = validatePayment2(d);
+        const e = validatePayment2(d, { requireInvoice });
         errs.replaceChildren(...Object.values(e).map(t => h('div', { class: 'form-err' }, t)));
         if (Object.keys(e).length) return;
         if (!(d.payment2_amount > 0)) d.payment2_method = d.payment2_method || null;
         try {
-          await ctx.save(o.id, { ...d, ...(thenStatus ? { status: thenStatus } : {}) },
+          await ctx.save(o.id, { ...d, ...(thenStatus ? { status: thenStatus, ...extra } : {}) },
             thenStatus ? `התשלום נשמר וההזמנה הועברה ל"${statusLabel(thenStatus)}"` : 'השלמת התשלום נשמרה');
           saved = true; m.close(); render();
         } catch { /* toast shown */ }
@@ -232,10 +286,10 @@ function buildShell() {
         const hsh = a.dataset.hash;
         a.classList.toggle('on', hsh === '#/' ? path === '#/' : path === hsh || (hsh === '#/orders' && path.startsWith('#/order/')));
       });
-      const att = ctx.attention();
-      const late = att.filter(x => x.s.level === 'late' || x.s.level === 'critical').length;
-      counts.attention.textContent = att.length || ''; counts.attention.hidden = !att.length;
-      counts.attention.classList.toggle('hot', late > 0);
+      const work = ctx.workQueue();
+      const hot = work.some(o => ['late', 'critical'].includes(ctx.slaOf(o)?.level));
+      counts.attention.textContent = work.length || ''; counts.attention.hidden = !work.length;
+      counts.attention.classList.toggle('hot', hot);
       counts.all.textContent = ctx.active().length;
       const arch = ctx.orders.filter(o => o.archived_at && !o.deleted_at).length;
       counts.archive.textContent = arch || ''; counts.archive.hidden = !arch;
